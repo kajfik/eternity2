@@ -1,0 +1,34 @@
+eternity2 solver | clues=5 threads=8 mode=mix out=runs
+
+[best] 2026-07-05 11:42:12 score=372  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:42:12 score=375  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:42:12 score=377  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:42:12 score=390  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:42:12 score=392  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:42:12 score=393  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:42:12 score=394  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:42:12 score=395  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:42:13 score=397  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:42:16 score=398  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:42:22 score=399  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:42:23 score=400  -> runs/best_c5.txt
+[    15s] best=400/480 restarts=37 avgdepth=62 completions=13 nodes=0.96B (64.0M/s) polish=14654(+51) seeds=33
+[    30s] best=400/480 restarts=63 avgdepth=72 completions=13 nodes=2.00B (69.3M/s) polish=26867(+53) seeds=34
+[    45s] best=400/480 restarts=92 avgdepth=77 completions=13 nodes=3.16B (77.3M/s) polish=37514(+56) seeds=36
+[    60s] best=400/480 restarts=120 avgdepth=79 completions=13 nodes=4.28B (74.7M/s) polish=49054(+62) seeds=41
+[    75s] best=400/480 restarts=148 avgdepth=79 completions=13 nodes=5.40B (74.7M/s) polish=59716(+75) seeds=44
+
+[best] 2026-07-05 11:43:29 score=401  -> runs/best_c5.txt
+[    90s] best=401/480 restarts=181 avgdepth=85 completions=13 nodes=6.72B (88.0M/s) polish=67683(+83) seeds=50
+[   105s] best=401/480 restarts=205 avgdepth=86 completions=13 nodes=7.68B (64.0M/s) polish=80895(+93) seeds=53

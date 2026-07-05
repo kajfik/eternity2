@@ -1,0 +1,22 @@
+eternity2 solver | clues=5 threads=8 mode=mix out=runs
+[    15s] best=-1/480 restarts=515 completions=0 nodes=2.04B (135.7M/s) polish=0(+0) seeds=0
+[    30s] best=-1/480 restarts=1226 completions=0 nodes=4.02B (132.2M/s) polish=0(+0) seeds=0
+
+[best] 2026-07-05 11:29:00 score=411  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:29:00 score=412  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:29:00 score=413  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:29:00 score=414  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:29:00 score=416  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:29:00 score=417  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:29:02 score=418  -> runs/best_c5.txt
+[    45s] best=418/480 restarts=1351 completions=2154835 nodes=4.66B (42.8M/s) polish=29981(+45) seeds=160
+
+[best] 2026-07-05 11:29:16 score=419  -> runs/best_c5.txt
+
+[best] 2026-07-05 11:29:18 score=420  -> runs/best_c5.txt

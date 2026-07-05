@@ -1,0 +1,4 @@
+eternity2 solver | clues=5 threads=8 mode=mix out=runs
+[    15s] best=-1/480 restarts=935 completions=0 nodes=2.88B (192.0M/s) polish=0(+0) seeds=0
+[    30s] best=-1/480 restarts=1783 completions=0 nodes=5.88B (200.0M/s) polish=0(+0) seeds=0
+[    45s] best=-1/480 restarts=2745 completions=0 nodes=8.80B (194.7M/s) polish=0(+0) seeds=0
