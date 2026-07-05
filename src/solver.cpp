@@ -1051,7 +1051,15 @@ static bool load_board_file(const std::string& path, Board& b) {
     return true;
 }
 
-static bool load_board_edges(const std::string& edges, Board& b) {
+static bool load_board_edges(std::string edges, Board& b) {
+    // accept either a bare 1024-letter string or a full bucas URL
+    size_t pos = edges.find("board_edges=");
+    if (pos != std::string::npos) {
+        pos += 12;
+        size_t end = pos;
+        while (end < edges.size() && edges[end] >= 'a' && edges[end] <= 'w') end++;
+        edges = edges.substr(pos, end - pos);
+    }
     if (edges.size() != NC * 4) return false;
     memset(&b, 0, sizeof b);
     bool usedp[256] = {};
