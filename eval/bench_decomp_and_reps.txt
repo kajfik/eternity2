@@ -1,0 +1,26 @@
+=== decomp (4x 9x9 quadrants, 3 min + 20s reconcile, 4 threads) ===
+[decomp] initial board score=394/480 (edges saved to C:/Users/kajfj/AppData/Local/Temp/claude/C--Users-kajfj-Documents-GitHub-eternity2/7b187041-0e91-4f57-9151-775d8806e455/scratchpad/decomp/b0_edges.txt)
+[decomp] polishing 4 quadrants (9x9, 2-cell overlap) for 180s in parallel
+[decomp] quadrant internal scores: 133->133 128->128 108->117 104->114 
+[decomp] merged: score=394/480 overlap_disagreements=17 dup_evicted=0 greedy_patched=4 seam_mismatches=45
+[decomp] reconciled: score=403/480 seam_mismatches=36 valid=yes
+[decomp] time: init 0.0s, quadrants 180.5s, reconcile 20.7s
+final best 403/480
+=== mono polish (same B0, 4 threads, 3m20s) ===
+seed board loaded: 394/480
+final best 413/480 restarts=0 avgdepth=0 maxdepth=0
+=== mix reference (from scratch, 4 threads, 3m20s) ===
+final best 410/480 restarts=30 avgdepth=67 maxdepth=178
+=== hunt-rep2 default ===
+final best -1/480 restarts=733 avgdepth=90 maxdepth=190
+=== mix-rep2 default ===
+final best 414/480 restarts=64 avgdepth=71 maxdepth=186
+=== hunt-rep2 model ===
+final best -1/480 restarts=729 avgdepth=93 maxdepth=189
+=== mix-rep2 model ===
+final best 413/480 restarts=75 avgdepth=82 maxdepth=183
+=== hunt-budget0 default ===
+final best -1/480 restarts=145490 avgdepth=4 maxdepth=145
+=== hunt-budget0 model ===
+final best -1/480 restarts=142799 avgdepth=4 maxdepth=144
+PHASE2_DONE

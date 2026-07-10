@@ -1,0 +1,9 @@
+=== hunt-rep3 default ===
+final best -1/480 restarts=694 avgdepth=85 maxdepth=190
+=== hunt-rep3 model ===
+final best -1/480 restarts=694 avgdepth=96 maxdepth=189
+=== hunt-rep4 default ===
+final best -1/480 restarts=702 avgdepth=90 maxdepth=189
+=== hunt-rep4 model ===
+final best -1/480 restarts=706 avgdepth=94 maxdepth=188
+PHASE3_DONE

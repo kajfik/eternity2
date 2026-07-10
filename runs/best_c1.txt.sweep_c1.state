@@ -1,0 +1,15 @@
+{"key": "40da0a6e50:10,1,6x4", "verdict": "UNKNOWN", "faults": 11}
+{"key": "40da0a6e50:9,1,6x4", "verdict": "UNKNOWN", "faults": 10}
+{"key": "40da0a6e50:9,0,6x4", "verdict": "UNKNOWN", "faults": 9}
+{"key": "40da0a6e50:10,0,6x4", "verdict": "INFEASIBLE", "faults": 9}
+{"key": "40da0a6e50:10,2,6x4", "verdict": "UNKNOWN", "faults": 9}
+{"key": "40da0a6e50:9,2,6x4", "verdict": "UNKNOWN", "faults": 8}
+{"key": "40da0a6e50:8,0,6x4", "verdict": "INFEASIBLE", "faults": 7}
+{"key": "40da0a6e50:5,1,6x4", "verdict": "UNKNOWN", "faults": 7}
+{"key": "40da0a6e50:8,0,8x6", "verdict": "UNKNOWN", "faults": 13}
+{"key": "40da0a6e50:8,1,8x6", "verdict": "UNKNOWN", "faults": 13}
+{"key": "40da0a6e50:7,1,9x5", "verdict": "UNKNOWN", "faults": 13}
+{"key": "40da0a6e50:10,0,6x8", "verdict": "UNKNOWN", "faults": 12}
+{"key": "40da0a6e50:10,1,6x8", "verdict": "UNKNOWN", "faults": 12}
+{"key": "40da0a6e50:7,0,9x5", "verdict": "UNKNOWN", "faults": 12}
+{"key": "40da0a6e50:6,1,9x5", "verdict": "UNKNOWN", "faults": 12}

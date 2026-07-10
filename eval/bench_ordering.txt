@@ -1,0 +1,19 @@
+=== hunt default ===
+final best -1/480 restarts=730 avgdepth=87 maxdepth=188
+=== hunt random ===
+final best -1/480 restarts=681 avgdepth=87 maxdepth=188
+=== hunt model ===
+final best -1/480 restarts=680 avgdepth=98 maxdepth=189
+=== hunt zone ===
+final best -1/480 restarts=769 avgdepth=88 maxdepth=188
+=== hunt model+zone ===
+final best -1/480 restarts=693 avgdepth=97 maxdepth=190
+=== mix default ===
+final best 411/480 restarts=52 avgdepth=40 maxdepth=182
+=== mix random ===
+final best 406/480 restarts=55 avgdepth=64 maxdepth=186
+=== mix model ===
+final best 414/480 restarts=69 avgdepth=83 maxdepth=188
+=== mix zone ===
+final best 413/480 restarts=60 avgdepth=60 maxdepth=184
+ALL_BENCHES_DONE
