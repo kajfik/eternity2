@@ -12,6 +12,7 @@ Constraints/preferences:
 - Runs on the user's own machine: Windows 11 Pro, Ryzen 9 3950X 16C/32T, RTX 2080 Ti. Windows Smart App Control was permanently disabled by the user (it blocked unsigned exes).
 - Every result must be output as a valid https://e2.bucas.name/ puzzle link (the solver writes one into `runs/best_c{1,5}.txt` and `runs/history_c{1,5}.log` on every new best).
 - Long hunts: `scripts\run5.ps1` / `run1.ps1` (auto-resume from `runs\best_c*.txt`; `-Minutes N` for timed runs). Build with `scripts\build.ps1`.
+- **Root launcher `run.ps1`** (`run.cmd` shim for fresh machines): interactive from-scratch/from-best runner — prompts for run type, clues (1/5), threads, minutes (blank = indefinite); builds solver.exe if missing; from-scratch uses `runs_scratch\` (gitignored, offers archive-and-restart if a scratch best exists), from-best resumes `runs\best_c{1,5}.txt`; console teed to `<outdir>\run_c<clues>_<ts>.log`, drift to `<outdir>\drift`. Non-interactive: `.\run.ps1 -Mode scratch -Clues 5 -Threads 30 -Minutes 90 [-Fresh]`. **The `$ScratchArgs`/`$BestArgs` blocks at the top of run.ps1 are the canonical best-known flag sets — whenever a flag config is proven better (A/B tested, e2lib-verified), updating those blocks is part of adopting it.**
 - **User starts long runs themselves** — do not launch unattended background hunts without asking.
 
 ## Solver architecture

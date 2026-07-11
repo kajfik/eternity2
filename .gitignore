@@ -1,3 +1,6 @@
 *.exe
 *.o
 __pycache__/
+runs_scratch/
+runs/run_*.log
+runs/drift/
