@@ -95,6 +95,16 @@ struct Config {
     // sigma-cycle-scale backtracks (80-154+ cells) from a record board --
     // completions become needle-rare, so pair with a much larger --band-nodes.
     int band_y0_min = 8;
+    // shallowest band start row for --mode band sweeps (default 12 = old
+    // 3-row minimum). Raise to 13/14 to sweep 2-/1-row bands -- the MITM
+    // endgame's territory. Polisher band rebuilds still cap y0 at 12.
+    int band_y0_max = 12;
+    // exact meet-in-the-middle endgame for <=2-row bands (<=32 free cells):
+    // split the band at a column cut, enumerate left-half fills into a
+    // (piece-mask, interface-signature) -> min-cost table, stream right-half
+    // fills and join on the complement mask. Decides (exhausts or improves)
+    // bands the budgeted DFS caps out on. Opt-in; needs cost2>=1 (default).
+    int band_mitm = 0;
     // --- from-scratch pipeline upgrades (2026-07-08 analysis) ---
     // hybrid completion: every hunter restart replays its deepest DFS prefix
     // and greedy-fills the rest, so restarts always emit a fresh-lineage
@@ -161,6 +171,26 @@ struct Config {
     int groups_n = 60;               // groups to generate
     int groups_iters = 1200;         // hill-climb swaps per group
     std::string groups_out = "eval/groups.txt";
+    // prefix racing / successive halving (raphael-anjou wiki LADDER item):
+    // a hunt turn becomes a cohort of K shallow restart prefixes; each round
+    // keeps the deeper half (tie-break: fewer slips spent) and doubles the
+    // node budget for the survivors, replaying their captured deepest prefix
+    // (reuses the --hybrid hyb_p/hyb_r machinery) instead of restarting from
+    // scratch. 0/1 = off (plain run_restart per turn).
+    int ladder = 0;
+    // border-ring pre-filter (raphael-anjou wiki item 4b): score each
+    // completed ring by inward-color supply weighted toward early scan
+    // depths (see init_ring_filter) and re-roll rings scoring in the worst
+    // PCT percent of a rolling per-thread sample. 0 = off (default: first
+    // perfect ring found is accepted).
+    int ring_filter = 0;
+    // hunter scan orientation (raphael-anjou wiki item 4c): the Hunter runs
+    // its whole restart in a frame rotated N*90cw -- the interior scan stays
+    // row-major top-left, but the pinned clues (asymmetric) land at different
+    // scan depths, which interacts with the slip schedule. Boards are
+    // un-rotated back to the standard frame before leaving the Hunter, so
+    // pools/best files/URLs are always standard. 0 = current behavior.
+    int scan_orient = 0;
 };
 static Config cfg;
 
@@ -476,6 +506,27 @@ static Board rotate_board(const Board& b, int orient) {
     return out;
 }
 
+// --scan-orient working-frame clue tables: the Hunter pins its clues at the
+// rotated cells with rot+orient so that un-rotating a completed working-frame
+// board restores the standard clue placements exactly. Identical to the
+// standard tables when scan_orient == 0.
+static bool HUNT_IS_CLUE[NC];
+static int HUNT_CLUE_AT[NC], HUNT_CLUE_ROT[NC];
+static void init_scan_orient() {
+    for (int s = 0; s < NC; s++) {
+        HUNT_IS_CLUE[s] = false;
+        HUNT_CLUE_AT[s] = -1;
+        HUNT_CLUE_ROT[s] = 0;
+    }
+    for (int s = 0; s < NC; s++)
+        if (IS_CLUE_CELL[s]) {
+            int ds = rotate_cell(s, cfg.scan_orient);
+            HUNT_IS_CLUE[ds] = true;
+            HUNT_CLUE_AT[ds] = CLUE_AT[s];
+            HUNT_CLUE_ROT[ds] = (CLUE_ROT[s] + cfg.scan_orient) & 3;
+        }
+}
+
 // ------------------------------------------------------------------ global best + seed pool
 // FNV-1a over (piece,rot,filled) per cell: identifies a board arrangement.
 // Used to deduplicate the pools -- without it, every incremental gain of one
@@ -539,7 +590,7 @@ static std::atomic<u64> g_nodes{0}, g_restarts{0}, g_completions{0},
     g_scatter_iters{0}, g_scatter_gains{0}, g_umbrella_jumps{0},
     g_region_tieproof{0}, g_parity_iters{0}, g_parity_gains{0},
     g_hybrid{0}, g_hyb_score_sum{0}, g_merge_iters{0}, g_merge_gains{0},
-    g_aborts{0};
+    g_aborts{0}, g_rings{0}, g_ring_rerolls{0};
 static std::atomic<int> g_depth_max{0};
 static std::atomic<bool> g_stop{false};
 static std::mutex g_log_mu;
@@ -672,6 +723,49 @@ static bool solve_ring(Board& b, Rng& rng) {
         }
     }
     return true;
+}
+
+// --ring-filter machinery. Structural fact that shapes the heuristic: every
+// complete ring uses all 56 edge pieces, and each edge piece's inward side is
+// fixed (the side opposite its grey side), so the MULTISET of inward colors
+// is identical across rings -- an unweighted sum over inward edges of any
+// per-color measure is ring-invariant. What differs between rings is the
+// ARRANGEMENT, so each inward edge's color supply is weighted by how early
+// the row-major interior scan must serve it (most restarts die in the first
+// scan row). Depth formula ignores clue-cell scan shifts and --tail-cols.
+static int RING_SUPPLY[23];  // sides per color on non-clue interior pieces
+static float RING_W[NC];     // border cell -> exp(-approx_scan_depth/8)
+
+static void init_ring_filter() {
+    bool clue_piece[256] = {};
+    for (int s = 0; s < NC; s++)
+        if (IS_CLUE_CELL[s]) clue_piece[CLUE_AT[s]] = true;
+    memset(RING_SUPPLY, 0, sizeof RING_SUPPLY);
+    for (int p = 0; p < 256; p++)
+        if (PTYPE[p] == 0 && !clue_piece[p])
+            for (int i = 0; i < 4; i++) RING_SUPPLY[e2::PIECE_DEFS[p][i]]++;
+    memset(RING_W, 0, sizeof RING_W);
+    for (int s = 0; s < NC; s++) {
+        if (CELL_TYPE[s] != 1) continue;
+        int x = s % W, y = s / W;
+        int ix = x == 0 ? 1 : x == W - 1 ? W - 2 : x;  // interior neighbor
+        int iy = y == 0 ? 1 : y == H - 1 ? H - 2 : y;
+        int d = (iy - 1) * (W - 2) + (ix - 1);
+        RING_W[s] = (float)std::exp(-d / 8.0);
+    }
+}
+
+static float ring_value(const Board& b) {
+    float v = 0;
+    for (int i = 0; i < 60; i++) {
+        int s = RING_CELLS[i];
+        if (CELL_TYPE[s] != 1) continue;
+        int x = s % W, y = s / W;
+        const u8* q = b.q(s);
+        int c = y == 0 ? q[2] : y == H - 1 ? q[0] : (x == 0 ? q[1] : q[3]);
+        v += RING_W[s] * (float)RING_SUPPLY[c];
+    }
+    return v;
 }
 
 // ------------------------------------------------------------------ hunter
@@ -842,6 +936,8 @@ struct Hunter {
     // hybrid completion: piece/rot of the deepest DFS prefix this restart
     // (captured whenever max_depth improves; scan order indices)
     u8 hyb_p[196], hyb_r[196];
+    int hyb_cost = 0, hyb_cost_pre = 0;  // cost/cost_pre at the hyb_p/hyb_r depth
+    bool ladder_on = false;  // --ladder: capture the prefix even if !cfg.hybrid
     // --- Verhaard adoptions (all flag-gated, off by default) ---
     bool grp_on = false;     // good-groups piece-class schedule this restart
     u8 pclass[256];          // 0 bad, 1 good, 2 precious, 3 useless
@@ -857,10 +953,18 @@ struct Hunter {
     // place/unplace only when the flag is on
     bool nab_on = false;
     u8 bcnt[NC];
+    // --ring-filter: rolling sample of generated ring values. Kept and
+    // rejected rings both enter the window, so the percentile threshold
+    // tracks the unfiltered solve_ring distribution.
+    static constexpr int RF_WIN = 1024, RF_WARM = 256;
+    float rf_win[RF_WIN];
+    u64 rf_n = 0;
+    float rf_thresh = 0;
 
     explicit Hunter(u64 seed) : rng(seed) {
         log_on = !cfg.log_placements.empty();
         nab_on = cfg.no_adj_breaks;
+        ladder_on = cfg.ladder >= 2;
         memset(bcnt, 0, sizeof bcnt);
         if (g_fs_on) fs.reset(new FitStats());
     }
@@ -879,6 +983,20 @@ struct Hunter {
         for (int d = 0; d <= FS_D; d++) g_fs.surv[d] += fs->surv[d];
         g_fs.restarts += fs->restarts;
         g_fs.completions += fs->completions;
+    }
+
+    // under --scan-orient the whole restart (ring, clues, scan, greedy tail)
+    // runs in a rotated instance; only un-rotated boards may reach the
+    // pools/best files, so every emission funnels through here. Score and
+    // conformance are rotation-invariant (rotate_board preserves matches and
+    // rim grey; clue un-mapping is exact by construction of HUNT_*).
+    Board out_board() const {
+        return cfg.scan_orient ? rotate_board(b, (4 - cfg.scan_orient) & 3) : b;
+    }
+    bool emit() {
+        if (!cfg.scan_orient) return report_completion(b);
+        Board sb = rotate_board(b, (4 - cfg.scan_orient) & 3);
+        return report_completion(sb);
     }
 
     void bump_D(int c, int dv) {
@@ -938,23 +1056,49 @@ struct Hunter {
         used[p] = false;
     }
 
+    // --ring-filter PCT: re-roll rings whose early-weighted inward supply
+    // (ring_value) falls in the worst PCT percent. The first RF_WARM rings
+    // pass unfiltered while the window fills; the threshold is the PCT-th
+    // percentile of the window, refreshed every 128 rings. Attempts are
+    // bounded so a stale threshold can never wedge a restart.
+    bool solve_ring_filtered() {
+        for (int att = 0;; att++) {
+            if (att) memset(&b, 0, sizeof b);
+            if (!solve_ring(b, rng)) return false;
+            float v = ring_value(b);
+            rf_win[rf_n++ % RF_WIN] = v;
+            g_rings.fetch_add(1, std::memory_order_relaxed);
+            if (rf_n >= RF_WARM && rf_n % 128 == 0) {
+                int m = (int)std::min<u64>(rf_n, RF_WIN);
+                float tmp[RF_WIN];
+                memcpy(tmp, rf_win, m * sizeof(float));
+                int k = std::min(m - 1, m * cfg.ring_filter / 100);
+                std::nth_element(tmp, tmp + k, tmp + m);
+                rf_thresh = tmp[k];
+            }
+            if (rf_n <= RF_WARM || v >= rf_thresh || att >= 63) return true;
+            g_ring_rerolls.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     bool setup_restart() {
         memset(&b, 0, sizeof b);
         memset(used, 0, sizeof used);
-        if (!solve_ring(b, rng)) return false;
+        if (cfg.ring_filter > 0 ? !solve_ring_filtered()
+                                : !solve_ring(b, rng)) return false;
         for (int s = 0; s < NC; s++)
             if (b.filled[s]) used[b.piece[s]] = true;
-        // clues
+        // clues (working-frame positions under --scan-orient)
         for (int s = 0; s < NC; s++)
-            if (IS_CLUE_CELL[s]) {
-                b.piece[s] = (u8)CLUE_AT[s];
-                b.rot[s] = (u8)CLUE_ROT[s];
+            if (HUNT_IS_CLUE[s]) {
+                b.piece[s] = (u8)HUNT_CLUE_AT[s];
+                b.rot[s] = (u8)HUNT_CLUE_ROT[s];
                 b.filled[s] = true;
-                used[CLUE_AT[s]] = true;
+                used[HUNT_CLUE_AT[s]] = true;
             }
         bool excl[256] = {};
         for (int s = 0; s < NC; s++)
-            if (IS_CLUE_CELL[s]) excl[CLUE_AT[s]] = true;
+            if (HUNT_IS_CLUE[s]) excl[HUNT_CLUE_AT[s]] = true;
         // good-groups piece classes for this restart (sampled before the
         // bucket build so class-priority ordering can use them)
         grp_on = g_groups_loaded;
@@ -996,10 +1140,10 @@ struct Hunter {
                                         : H - 1;
         for (int y = 1; y < tail_y0; y++)
             for (int x = 1; x < W - 1; x++)
-                if (!IS_CLUE_CELL[y * W + x]) scan[n_scan++] = y * W + x;
+                if (!HUNT_IS_CLUE[y * W + x]) scan[n_scan++] = y * W + x;
         for (int x = 1; x < W - 1; x++)
             for (int y = tail_y0; y < H - 1; y++)
-                if (!IS_CLUE_CELL[y * W + x]) scan[n_scan++] = y * W + x;
+                if (!HUNT_IS_CLUE[y * W + x]) scan[n_scan++] = y * W + x;
         free_row = cfg.fr_min + (int)rng.below((u32)(cfg.fr_max - cfg.fr_min + 1));
         if (cfg.tail_cols > 0) free_row = std::min(free_row, tail_y0);
         int cur_best = g_best_score.load(std::memory_order_relaxed);
@@ -1023,16 +1167,18 @@ struct Hunter {
         if (d == n_scan) {
             g_completions.fetch_add(1, std::memory_order_relaxed);
             if (fs) fs->completions++;
-            report_completion(b);
+            emit();
             // anytime B&B: within this restart only accept strictly better
             budget = std::min(budget, cost - 1);
             return;
         }
         if (d > max_depth) {
             max_depth = d;
+            hyb_cost = cost;
+            hyb_cost_pre = cost_pre;
             // capture the whole prefix, not an increment: the path may have
             // backtracked through shallower cells since the last snapshot
-            if (cfg.hybrid)
+            if (cfg.hybrid || ladder_on)
                 for (int i = 0; i < d; i++) {
                     hyb_p[i] = b.piece[scan[i]];
                     hyb_r[i] = b.rot[scan[i]];
@@ -1167,7 +1313,7 @@ struct Hunter {
             greedy_fill(max_depth);
             g_hybrid.fetch_add(1, std::memory_order_relaxed);
             g_hyb_score_sum.fetch_add((u64)b.score(), std::memory_order_relaxed);
-            report_completion(b);
+            emit();
         }
         if (fs) {
             fs->restarts++;
@@ -1186,6 +1332,174 @@ struct Hunter {
                       << (int)sp_r[i] << ':' << (int)sp_w[i] << ':' << (int)sp_n[i];
             g_log << '\n';
         }
+    }
+
+    // --- ladder: prefix racing / successive halving (raphael-anjou wiki) ---
+    // A cohort of K independent restart prefixes is run to a small node
+    // budget; the deeper half (tie-break: fewer slips spent at that depth)
+    // is kept and replayed from its captured deepest prefix (the --hybrid
+    // hyb_p/hyb_r machinery) with a doubled node budget, repeating until one
+    // survivor remains, which then gets the rest of the turn's node budget.
+    // Every cohort member -- eliminated or not -- ends by hybrid-completing
+    // from wherever it stopped, same as a plain run_restart() would.
+    struct LadderCand {
+        Board ring_b;
+        bool ring_used[256];
+        int ring_D[23], ring_avail[23], ring_deficit = 0;
+        int budget = 0, free_row = 0;
+        u8 pclass_snap[256];
+        u8 hyb_p[196], hyb_r[196];
+        int max_depth = 0, cost = 0, cost_pre = 0;
+    };
+
+    // restore a candidate's ring/interior baseline + replay its captured
+    // prefix onto the live board; returns (cost, cost_pre) at c.max_depth so
+    // dfs() can resume exactly as if it had never unwound
+    std::pair<int, int> ladder_restore(LadderCand& c, const bool* excl) {
+        b = c.ring_b;
+        memcpy(used, c.ring_used, sizeof used);
+        memcpy(D, c.ring_D, sizeof D);
+        memcpy(avail, c.ring_avail, sizeof avail);
+        deficit = c.ring_deficit;
+        budget = c.budget;
+        free_row = c.free_row;
+        if (nab_on) memset(bcnt, 0, sizeof bcnt);
+        if (grp_on) {
+            memcpy(pclass, c.pclass_snap, sizeof pclass);
+            good_used = 0;
+            useless_left = 0;
+            for (int p = 0; p < 256; p++)
+                if (pclass[p] == 3 && !used[p]) useless_left++;
+        }
+        bk.build(rng, excl, grp_on && cfg.group_order ? pclass : nullptr);
+        int cst = 0, cst_pre = 0;
+        for (int i = 0; i < c.max_depth; i++) {
+            int cc = place(scan[i], c.hyb_p[i], c.hyb_r[i]);
+            cst += cc;
+            if ((scan[i] / W) < free_row) cst_pre += cc;
+            if (grp_on) {
+                int pc = pclass[c.hyb_p[i]];
+                if (pc == 3) useless_left--; else if (pc >= 1) good_used++;
+            }
+        }
+        max_depth = c.max_depth;
+        memcpy(hyb_p, c.hyb_p, (size_t)c.max_depth);
+        memcpy(hyb_r, c.hyb_r, (size_t)c.max_depth);
+        hyb_cost = cst;
+        hyb_cost_pre = cst_pre;
+        return {cst, cst_pre};
+    }
+
+    // board already has [0, entry_depth) placed; hyb_p/hyb_r hold a valid
+    // prefix out to final_depth (>= entry_depth). Place the rest of the
+    // captured prefix, hybrid-complete it (same gating as run_restart), and
+    // fold it into the usual restart/depth/hybrid stats.
+    void ladder_finish(int entry_depth, int final_depth) {
+        for (int i = entry_depth; i < final_depth; i++)
+            place(scan[i], hyb_p[i], hyb_r[i]);
+        if (cfg.hybrid && final_depth > 0 && final_depth >= cfg.hybrid_min_depth &&
+            !g_stop.load(std::memory_order_relaxed)) {
+            greedy_fill(final_depth);
+            g_hybrid.fetch_add(1, std::memory_order_relaxed);
+            g_hyb_score_sum.fetch_add((u64)b.score(), std::memory_order_relaxed);
+            emit();
+        }
+        if (fs) {
+            fs->restarts++;
+            fs->surv[final_depth <= FS_D ? final_depth : FS_D]++;
+        }
+        g_restarts.fetch_add(1, std::memory_order_relaxed);
+        g_depth_sum.fetch_add((u64)final_depth, std::memory_order_relaxed);
+        int cur = g_depth_max.load(std::memory_order_relaxed);
+        while (final_depth > cur && !g_depth_max.compare_exchange_weak(cur, final_depth)) {}
+    }
+
+    void run_ladder(int K) {
+        if (K < 2) { run_restart(); return; }
+        bool excl[256] = {};
+        for (int s = 0; s < NC; s++)
+            if (HUNT_IS_CLUE[s]) excl[HUNT_CLUE_AT[s]] = true;
+
+        std::vector<LadderCand> cands;
+        cands.reserve((size_t)K);
+        u64 total_nodes = 0;
+        u64 rung_cap = std::max<u64>(3000, cfg.node_cap / ((u64)K * 20));
+
+        for (int i = 0; i < K; i++) {
+            if (!setup_restart()) continue;
+            LadderCand c;
+            c.ring_b = b;
+            memcpy(c.ring_used, used, sizeof used);
+            memcpy(c.ring_D, D, sizeof D);
+            memcpy(c.ring_avail, avail, sizeof avail);
+            c.ring_deficit = deficit;
+            c.budget = budget;
+            c.free_row = free_row;
+            if (grp_on) memcpy(c.pclass_snap, pclass, sizeof pclass);
+            max_depth = 0;
+            snap_depth = 0;
+            node_cap = rung_cap;
+            nodes = 0;
+            dfs(0, 0, 0);
+            total_nodes += nodes;
+            c.max_depth = max_depth;
+            c.cost = hyb_cost;
+            c.cost_pre = hyb_cost_pre;
+            memcpy(c.hyb_p, hyb_p, (size_t)max_depth);
+            memcpy(c.hyb_r, hyb_r, (size_t)max_depth);
+            cands.push_back(c);
+            if (g_stop.load(std::memory_order_relaxed)) break;
+        }
+        if (cands.empty()) { nodes = total_nodes; return; }
+
+        auto by_progress = [](const LadderCand& x, const LadderCand& y) {
+            if (x.max_depth != y.max_depth) return x.max_depth > y.max_depth;
+            return x.cost < y.cost;
+        };
+
+        while (cands.size() > 1) {
+            std::sort(cands.begin(), cands.end(), by_progress);
+            size_t keep = (cands.size() + 1) / 2;
+            if (keep < 1) keep = 1;
+            for (size_t i = keep; i < cands.size(); i++) {
+                ladder_restore(cands[i], excl);
+                ladder_finish(cands[i].max_depth, cands[i].max_depth);
+            }
+            cands.resize(keep);
+            if (cands.size() == 1 || g_stop.load(std::memory_order_relaxed)) break;
+            rung_cap *= 2;
+            for (auto& c : cands) {
+                auto pr = ladder_restore(c, excl);
+                node_cap = rung_cap;
+                nodes = 0;
+                dfs(c.max_depth, pr.first, pr.second);
+                total_nodes += nodes;
+                c.max_depth = max_depth;
+                c.cost = hyb_cost;
+                c.cost_pre = hyb_cost_pre;
+                memcpy(c.hyb_p, hyb_p, (size_t)max_depth);
+                memcpy(c.hyb_r, hyb_r, (size_t)max_depth);
+                if (g_stop.load(std::memory_order_relaxed)) break;
+            }
+        }
+
+        LadderCand& w = cands[0];
+        int entry = w.max_depth;
+        auto pr = ladder_restore(w, excl);
+        u64 remaining = cfg.node_cap > total_nodes ? cfg.node_cap - total_nodes : rung_cap;
+        node_cap = remaining;
+        nodes = 0;
+        dfs(entry, pr.first, pr.second);
+        total_nodes += nodes;
+        ladder_finish(entry, max_depth);
+
+        nodes = total_nodes;
+        g_nodes.fetch_add(total_nodes, std::memory_order_relaxed);
+    }
+
+    void run_turn() {
+        if (cfg.ladder >= 2) run_ladder(cfg.ladder);
+        else run_restart();
     }
 
     // greedy min-mismatch fill of scan[d0..n_scan) with random tie-break;
@@ -1221,7 +1535,7 @@ struct Hunter {
         if (!setup_restart()) return;
         greedy_fill(0);
         g_completions.fetch_add(1, std::memory_order_relaxed);
-        report_completion(b);
+        emit();
         g_restarts.fetch_add(1, std::memory_order_relaxed);
     }
 };
@@ -1339,6 +1653,275 @@ struct BandSolver {
         }
     }
 
+    // ---- meet-in-the-middle endgame (--band-mitm, <=2-row bands) ----
+    // Split the band's columns at a cut xm; enumerate every left-half fill
+    // within the total budget into a table keyed by (piece mask over the
+    // freed set, interface signature = east colors on the cut), keeping the
+    // min internal cost per key; then stream right-half fills and join on
+    // the complement mask (left+right must partition the freed pieces, so
+    // the matching left mask is forced). Total cost = left internal + right
+    // internal + Hamming(sigL, sigR) on the cut edges. Exact minimum over
+    // the same move space as dfs() (requires cost2>=1 so double breaks are
+    // reachable); a completed run = decided band (exhausted or improved),
+    // which is the point: wide shallow bands where dfs caps out undecided.
+    static constexpr size_t MITM_CAP = 1u << 26;  // raw table entries before compact (8 B each,
+                                                  // 512 MB peak; fires once, --mode band only);
+                                                  // bail if distinct keys stay > 3/4 of this
+    int mitm_scanL[32], mitm_scanR[32];  // half scans, row-major (W/N invariant holds)
+    int mitm_idxL[32], mitm_idxR[32];    // original scan[] index of each half cell
+    int nL = 0, nR = 0;
+    bool mitm_defer[32];                 // right cell's W edge crosses the cut (join-time)
+    int pool_bit[256];                   // freed piece -> bit in the subset mask
+    int if_cell[2], n_if = 0;            // left cell of each interface edge, sig position order
+    std::vector<u64> mitm_tab;           // packed (mask<<20)|(sig<<8)|cost, sorted at join time
+    bool mitm_abort = false, mitm_found = false;
+    int mitm_status = 0;                 // 0 unused, 1 decided, 2 bail-mem, 3 bail-nodes/stop,
+                                         // 4 replay failed (must not happen; incumbent kept)
+    u64 mitm_joins = 0;
+    int cur_best_total = 0, l_min = 0, replay_cost = 0;
+    u32 full_mask = 0;
+    u32 bj_maskL = 0; int bj_sigL = 0, bj_costL = 0;  // best-join record for replay
+    u8 bj_rp[32], bj_rr[32];             // right-half arrangement of the best join
+
+    bool mitm_compact(bool final_pass) {
+        std::sort(mitm_tab.begin(), mitm_tab.end());
+        size_t w = 0;
+        for (size_t i = 0; i < mitm_tab.size(); i++) {
+            if (w && (mitm_tab[w - 1] >> 8) == (mitm_tab[i] >> 8)) continue;  // same (mask,sig): keep min cost
+            mitm_tab[w++] = mitm_tab[i];
+        }
+        mitm_tab.resize(w);
+        if (!final_pass && w >= MITM_CAP * 3 / 4) {
+            mitm_abort = true;
+            mitm_status = 2;
+            return false;
+        }
+        return true;
+    }
+
+    int mitm_sig(Board& b, bool right) const {
+        int sig = 0;
+        for (int i = 0; i < n_if; i++)
+            sig |= (int)b.q(if_cell[i] + (right ? 1 : 0))[right ? 3 : 1] << (5 * i);
+        return sig;
+    }
+
+    void mitm_left(Board& b, int d, int cost, u32 mask) {
+        if (mitm_abort) return;
+        if (g_stop.load(std::memory_order_relaxed)) { mitm_abort = true; mitm_status = 3; return; }
+        if (d == nL) {
+            if (cost < l_min) l_min = cost;
+            mitm_tab.push_back(((u64)mask << 20) | ((u64)mitm_sig(b, false) << 8) | (u64)cost);
+            if (mitm_tab.size() >= MITM_CAP) mitm_compact(false);
+            return;
+        }
+        int s = mitm_scanL[d];
+        int wcol = b.q(s - 1)[1];
+        int ncol = b.q(s - W)[2];
+        auto try_list = [&](const std::vector<u32>& list, bool skip_exact_n,
+                            bool skip_exact_w) {
+            for (u32 v : list) {
+                if (mitm_abort) return;
+                if (used[CP(v)]) continue;
+                if (skip_exact_n && (int)CN(v) == ncol) continue;
+                if (skip_exact_w && (int)CW(v) == wcol) continue;
+                nodes++;
+                if (nodes > node_cap) { mitm_abort = true; mitm_status = 3; return; }
+                int c = place(b, s, CP(v), CR(v));
+                if (cost + c + deficit > budget) { unplace(b, s); continue; }
+                mitm_left(b, d + 1, cost + c, mask | (1u << pool_bit[CP(v)]));
+                unplace(b, s);
+            }
+        };
+        try_list(bk.exact[0][wcol][ncol], false, false);
+        if (budget - cost > deficit) {
+            try_list(bk.by_w[0][wcol], true, false);
+            try_list(bk.by_n[0][ncol], false, true);
+            if (cfg.cost2 >= 1 && budget - cost > deficit + 1)
+                try_list(bk.all_list[0], true, true);
+        }
+    }
+
+    void mitm_join(Board& b, int cr, u32 mask) {
+        mitm_joins++;
+        int sigR = mitm_sig(b, true);
+        u32 T = full_mask ^ mask;  // the left mask is forced: exact partition
+        auto it = std::lower_bound(mitm_tab.begin(), mitm_tab.end(), (u64)T << 20);
+        for (; it != mitm_tab.end() && (*it >> 20) == T; ++it) {
+            int sigL = (int)((*it >> 8) & 0xFFF);
+            int cl = (int)(*it & 0xFF);
+            int h = 0;
+            for (int i = 0; i < n_if; i++)
+                h += ((sigL >> (5 * i)) & 31) != ((sigR >> (5 * i)) & 31);
+            int total = cl + cr + h;
+            if (total < cur_best_total) {
+                cur_best_total = total;
+                bj_maskL = T; bj_sigL = sigL; bj_costL = cl;
+                for (int i = 0; i < nR; i++) {
+                    bj_rp[i] = b.piece[mitm_scanR[i]];
+                    bj_rr[i] = b.rot[mitm_scanR[i]];
+                }
+            }
+        }
+    }
+
+    void mitm_right(Board& b, int d, int cost, u32 mask) {
+        if (mitm_abort) return;
+        if (g_stop.load(std::memory_order_relaxed)) { mitm_abort = true; mitm_status = 3; return; }
+        if (d == nR) { mitm_join(b, cost, mask); return; }
+        int s = mitm_scanR[d];
+        int ncol = b.q(s - W)[2];
+        int wcol = mitm_defer[d] ? -1 : b.q(s - 1)[1];
+        // right budget: any full fill costs >= l_min on the left, so the
+        // right side (internal + future) may spend at most best-1-l_min
+        int budget_eff = cur_best_total - 1 - l_min;
+        auto try_list = [&](const std::vector<u32>& list, bool skip_exact_n,
+                            bool skip_exact_w) {
+            for (u32 v : list) {
+                if (mitm_abort) return;
+                if (used[CP(v)]) continue;
+                if (skip_exact_n && (int)CN(v) == ncol) continue;
+                if (skip_exact_w && (int)CW(v) == wcol) continue;
+                nodes++;
+                if (nodes > node_cap) { mitm_abort = true; mitm_status = 3; return; }
+                int c = place(b, s, CP(v), CR(v));
+                if (cost + c + deficit > budget_eff) { unplace(b, s); continue; }
+                mitm_right(b, d + 1, cost + c, mask | (1u << pool_bit[CP(v)]));
+                unplace(b, s);
+                budget_eff = cur_best_total - 1 - l_min;  // joins may have tightened it
+            }
+        };
+        if (mitm_defer[d]) {
+            // W crosses the cut: candidates keyed by N only; the W edge is
+            // charged at join time via the signature Hamming distance
+            try_list(bk.by_n[0][ncol], false, false);
+            if (budget_eff - cost > deficit)
+                try_list(bk.all_list[0], true, false);  // N-mismatch tier
+        } else {
+            try_list(bk.exact[0][wcol][ncol], false, false);
+            if (budget_eff - cost > deficit) {
+                try_list(bk.by_w[0][wcol], true, false);
+                try_list(bk.by_n[0][ncol], false, true);
+                if (cfg.cost2 >= 1 && budget_eff - cost > deficit + 1)
+                    try_list(bk.all_list[0], true, true);
+            }
+        }
+    }
+
+    // materialize the winning left fill: re-enumerate restricted to the
+    // recorded piece mask (a massive prune -- 13 named pieces), accept the
+    // first fill matching (sig, cost<=bj_costL). Any such fill closes the
+    // recorded join total or better. No node cap: bounded and tiny.
+    void mitm_replay(Board& b, int d, int cost) {
+        if (mitm_found) return;
+        if (d == nL) {
+            if (mitm_sig(b, false) == bj_sigL && cost <= bj_costL) {
+                replay_cost = cost;
+                for (int i = 0; i < nL; i++) {
+                    best_piece[mitm_idxL[i]] = b.piece[mitm_scanL[i]];
+                    best_rot[mitm_idxL[i]] = b.rot[mitm_scanL[i]];
+                }
+                mitm_found = true;
+            }
+            return;
+        }
+        int s = mitm_scanL[d];
+        int wcol = b.q(s - 1)[1];
+        int ncol = b.q(s - W)[2];
+        auto try_list = [&](const std::vector<u32>& list, bool skip_exact_n,
+                            bool skip_exact_w) {
+            for (u32 v : list) {
+                if (mitm_found) return;
+                if (used[CP(v)]) continue;
+                if (!((bj_maskL >> pool_bit[CP(v)]) & 1)) continue;
+                if (skip_exact_n && (int)CN(v) == ncol) continue;
+                if (skip_exact_w && (int)CW(v) == wcol) continue;
+                int c = place(b, s, CP(v), CR(v));
+                if (cost + c > bj_costL) { unplace(b, s); continue; }
+                mitm_replay(b, d + 1, cost + c);
+                unplace(b, s);
+            }
+        };
+        try_list(bk.exact[0][wcol][ncol], false, false);
+        try_list(bk.by_w[0][wcol], true, false);
+        try_list(bk.by_n[0][ncol], false, true);
+        try_list(bk.all_list[0], true, true);
+    }
+
+    // Preconditions: solve() has cleared the free cells, set up used/D/avail/
+    // buckets, and set best_*=incumbent, best_cost=inc_cost, budget=inc-1.
+    // Returns true if MITM owned the band (even on bail -- no DFS fallback,
+    // so A/B node accounting stays clean); false = preconditions not met.
+    bool mitm_run(Board& b, int y0) {
+        mitm_status = 0; mitm_joins = 0; mitm_abort = false; mitm_found = false;
+        mitm_tab.clear();
+        if (n_scan < 2 || n_scan > 32 || y0 < 13 || cfg.cost2 < 1) return false;
+        // cut: prefix column count closest to an even split
+        int colcnt[W] = {};
+        for (int i = 0; i < n_scan; i++) colcnt[scan[i] % W]++;
+        int xm = 0, pref = 0, bestd = 1 << 30;
+        for (int x = 1; x <= 13; x++) {
+            pref += colcnt[x];
+            int dv = std::abs(2 * pref - n_scan);
+            if (dv < bestd) { bestd = dv; xm = x; }
+        }
+        nL = nR = 0;
+        for (int i = 0; i < n_scan; i++) {
+            int s = scan[i];
+            if (s % W <= xm) { mitm_idxL[nL] = i; mitm_scanL[nL++] = s; }
+            else             { mitm_idxR[nR] = i; mitm_scanR[nR++] = s; }
+        }
+        if (nL == 0 || nR == 0) return false;
+        for (int i = 0; i < nR; i++) {
+            int s = mitm_scanR[i];
+            mitm_defer[i] = (s % W - 1 <= xm) && !b.filled[s - 1];
+        }
+        n_if = 0;
+        for (int y = y0; y <= 14; y++) {
+            int sl = y * W + xm;
+            if (!b.filled[sl] && !b.filled[sl + 1]) {
+                if (n_if >= 2) return false;  // >2 interface edges: not a <=2-row band
+                if_cell[n_if++] = sl;
+            }
+        }
+        for (int i = 0; i < n_scan; i++) pool_bit[b.piece[scan[i]]] = i;
+        // NB: b.piece[] on cleared cells still holds the removed pieces
+        // (solve() only reset filled[]), which is exactly the freed pool.
+        full_mask = n_scan == 32 ? 0xFFFFFFFFu : ((1u << n_scan) - 1);
+        cur_best_total = best_cost;   // = inc_cost
+        l_min = budget + 1;           // sentinel until the first left fill lands
+        mitm_tab.reserve(1u << 20);
+
+        mitm_left(b, 0, 0, 0);
+        if (mitm_abort) {
+            last_mitm_tab = mitm_tab.size();
+            mitm_tab.clear();
+            mitm_tab.shrink_to_fit();
+            return true;
+        }
+        mitm_compact(true);
+        last_mitm_tab = mitm_tab.size();
+        if (!mitm_tab.empty()) mitm_right(b, 0, 0, 0);
+        // empty table = no left fill within budget = nothing beats the
+        // incumbent; that is a full decision, not a bail
+        if (!mitm_abort) mitm_status = 1;
+        if (cur_best_total < best_cost) {
+            mitm_replay(b, 0, 0);
+            if (mitm_found) {
+                for (int i = 0; i < nR; i++) {
+                    best_piece[mitm_idxR[i]] = bj_rp[i];
+                    best_rot[mitm_idxR[i]] = bj_rr[i];
+                }
+                best_cost = cur_best_total - (bj_costL - replay_cost);
+            } else {
+                mitm_status = 4;  // incumbent stays in best_*: no harm done
+            }
+        }
+        mitm_tab.clear();
+        mitm_tab.shrink_to_fit();
+        return true;
+    }
+
     // b must already be rotated to the working orientation. frozen[] marks
     // cells (in b's orientation) that must never move (transformed clue
     // cells). Returns the improvement (incumbent_cost - best_cost achieved),
@@ -1375,6 +1958,8 @@ struct BandSolver {
         last_incumbent_cost = last_best_cost = inc_cost;
         last_n_free = n_scan;
         last_nodes = 0;
+        last_mitm = 0;
+        last_decided = true;  // perfect band = trivially decided
         if (inc_cost == 0) return 0;  // band already perfect
 
         // pool: pieces currently on free cells; remove them (clear filled),
@@ -1416,7 +2001,15 @@ struct BandSolver {
             best_piece[i] = orig_piece[i];
             best_rot[i] = orig_rot[i];
         }
-        dfs(b, 0, 0);
+        bool mitm_owned = cfg.band_mitm != 0 && mitm_run(b, y0);
+        if (!mitm_owned) dfs(b, 0, 0);
+        last_mitm = mitm_owned ? mitm_status : 0;
+        last_mitm_joins = mitm_owned ? mitm_joins : 0;
+        // decided = the search ran to completion, so the result (improved or
+        // proven no-better-fill) is exact rather than a node-cap timeout
+        last_decided = mitm_owned
+                           ? mitm_status == 1
+                           : nodes <= node_cap && !g_stop.load(std::memory_order_relaxed);
 
         int improvement = best_cost < inc_cost ? inc_cost - best_cost : 0;
         // apply best (== incumbent if nothing better was found)
@@ -1433,6 +2026,9 @@ struct BandSolver {
     // stats from the last solve() call, for --mode band reporting
     int last_incumbent_cost = 0, last_best_cost = 0, last_n_free = 0;
     u64 last_nodes = 0;
+    int last_mitm = 0;             // mitm_status of the last call (0 = dfs path)
+    u64 last_mitm_tab = 0, last_mitm_joins = 0;
+    bool last_decided = false;
 };
 
 static void hungarian(int n, const int* cost, int* row_of_col);  // defined below
@@ -2269,7 +2865,10 @@ struct Polisher {
     // band of rows (y0..14) exactly under a mismatch budget, rotate back
     bool try_band(Rng& r) {
         int orient = (int)r.below(4);
-        int y0 = cfg.band_y0_min + (int)r.below((u32)(13 - cfg.band_y0_min));
+        // y0 range stays [min,12] here even when --band-y0-min is 13/14 (the
+        // relaxed clamp exists for 2-row --mode band sweeps, not rebuilds)
+        int lo = std::min(cfg.band_y0_min, 12);
+        int y0 = lo + (int)r.below((u32)(13 - lo));
         Board rb = rotate_board(cur, orient);
         bool frozen[NC] = {};
         for (int s = 0; s < NC; s++)
@@ -2575,7 +3174,7 @@ static int run_decomp() {
     } else {
         auto* h = new Hunter(rng.next());
         h->greedy_complete();
-        B0 = h->b;
+        B0 = h->out_board();
         delete h;
     }
     int b0_score = B0.score();
@@ -2898,7 +3497,7 @@ static int run_make_groups() {
 // ------------------------------------------------------------------ threads & main
 static void hunter_thread(u64 seed) {
     Hunter h(seed);
-    while (!g_stop.load()) h.run_restart();
+    while (!g_stop.load()) h.run_turn();
 }
 
 static void polisher_thread(u64 seed, int id) {
@@ -2922,7 +3521,7 @@ static void mix_thread(u64 seed, int id) {
             // multi-second polish blocks. One full-cap restart (the old
             // behavior when restarts always exhausted node_cap) == one turn.
             u64 spent = 0;
-            do { h.run_restart(); spent += h.nodes; }
+            do { h.run_turn(); spent += h.nodes; }
             while (spent < cfg.node_cap && !g_stop.load());
         }
     }
@@ -2972,7 +3571,7 @@ static void status_thread() {
         printf("[%6llds] best=%d/480 restarts=%llu avgdepth=%llu maxdepth=%d "
                "completions=%llu hyb=%llu hybavg=%.1f ab=%llu nodes=%.2fB (%.1fM/s) polish=%llu(+%llu) "
                "seeds=%zu fresh=%zu plat=%zu umbrella=%llu tieproof=%llu "
-               "parity=%llu(+%llu) merge=%llu(+%llu)\n",
+               "parity=%llu(+%llu) merge=%llu(+%llu)",
                (long long)el, g_best_score.load(), (unsigned long long)rs,
                (unsigned long long)(rs ? g_depth_sum.load() / rs : 0),
                g_depth_max.load(),
@@ -2989,6 +3588,11 @@ static void status_thread() {
                (unsigned long long)g_parity_gains.load(),
                (unsigned long long)g_merge_iters.load(),
                (unsigned long long)g_merge_gains.load());
+        if (cfg.ring_filter > 0)
+            printf(" rings=%llu rerolls=%llu",
+                   (unsigned long long)g_rings.load(),
+                   (unsigned long long)g_ring_rerolls.load());
+        printf("\n");
         last_nodes = n;
         fflush(stdout);
     }
@@ -3030,7 +3634,9 @@ int main(int argc, char** argv) {
         else if (a == "--drift-dir") cfg.drift_dir = next();
         else if (a == "--cost2") cfg.cost2 = std::stoi(next());
         else if (a == "--parity-pct") cfg.parity_pct = std::stoi(next());
-        else if (a == "--band-y0-min") cfg.band_y0_min = std::max(1, std::min(12, std::stoi(next())));
+        else if (a == "--band-y0-min") cfg.band_y0_min = std::max(1, std::min(14, std::stoi(next())));
+        else if (a == "--band-y0-max") cfg.band_y0_max = std::max(1, std::min(14, std::stoi(next())));
+        else if (a == "--band-mitm") cfg.band_mitm = std::stoi(next());
         else if (a == "--hybrid") cfg.hybrid = std::stoi(next()) != 0;
         else if (a == "--hybrid-min-depth") cfg.hybrid_min_depth = std::stoi(next());
         else if (a == "--tie-pct") cfg.tie_pct = std::stoi(next());
@@ -3063,6 +3669,9 @@ int main(int argc, char** argv) {
         else if (a == "--groups-n") cfg.groups_n = std::stoi(next());
         else if (a == "--groups-iters") cfg.groups_iters = std::stoi(next());
         else if (a == "--groups-out") cfg.groups_out = next();
+        else if (a == "--ladder") cfg.ladder = std::stoi(next());
+        else if (a == "--ring-filter") cfg.ring_filter = std::max(0, std::min(99, std::stoi(next())));
+        else if (a == "--scan-orient") cfg.scan_orient = std::stoi(next()) & 3;
         else { printf("unknown arg %s\n", a.c_str()); return 1; }
     }
     if (cfg.threads <= 0) {
@@ -3070,7 +3679,9 @@ int main(int argc, char** argv) {
         cfg.threads = std::max(1, hc - 2);
     }
     init_static(cfg.clues);
+    init_scan_orient();
     init_ring_cells();
+    init_ring_filter();
     g_plateau.cap = (size_t)std::max(2, cfg.plateau_cap);
     fs::create_directories(cfg.out_dir);
     if (!cfg.drift_dir.empty()) fs::create_directories(cfg.drift_dir);
@@ -3096,6 +3707,10 @@ int main(int argc, char** argv) {
             printf("ERROR: cannot open %s\n", cfg.log_placements.c_str());
             return 1;
         }
+        if (cfg.scan_orient)
+            printf("WARN: --log-placements cells are working-frame under "
+                   "--scan-orient %d; do not mix with orient-0 training data\n",
+                   cfg.scan_orient);
     }
     if (!cfg.groups_file.empty() && !load_groups(cfg.groups_file)) {
         printf("ERROR: cannot load groups file %s\n", cfg.groups_file.c_str());
@@ -3151,6 +3766,11 @@ int main(int argc, char** argv) {
         printf("abort points: %zu milestones\n", g_abort_ms.size());
     if (cfg.tail_cols > 0)
         printf("tail-cols: last %d interior rows column-wise\n", cfg.tail_cols);
+    if (cfg.ladder >= 2)
+        printf("ladder: cohort K=%d (prefix-racing successive halving)\n", cfg.ladder);
+    if (cfg.scan_orient)
+        printf("scan-orient: %d (hunter frame rotated %d*90cw; outputs un-rotated)\n",
+               cfg.scan_orient, cfg.scan_orient);
 
     if (cfg.mode == "make-groups") return run_make_groups();
 
@@ -3177,7 +3797,7 @@ int main(int argc, char** argv) {
         } else {
             auto* h = new Hunter(12345);
             h->greedy_complete();
-            B = h->b;
+            B = h->out_board();
             delete h;
         }
         int s0 = B.score();
@@ -3210,6 +3830,32 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // --scan-orient clue tables: at every orientation the working-frame
+        // clues must un-map exactly onto the standard clue placements
+        int so_save = cfg.scan_orient;
+        for (int k = 0; k < 4; k++) {
+            cfg.scan_orient = k;
+            init_scan_orient();
+            int n_hunt = 0;
+            for (int s = 0; s < NC; s++) {
+                if (!HUNT_IS_CLUE[s]) continue;
+                n_hunt++;
+                int ss = rotate_cell(s, (4 - k) & 3);
+                if (!IS_CLUE_CELL[ss] || CLUE_AT[ss] != HUNT_CLUE_AT[s] ||
+                    CLUE_ROT[ss] != ((HUNT_CLUE_ROT[s] - k) & 3)) {
+                    printf("selftest FAIL: scan-orient %d clue table mismapped at cell %d\n", k, s);
+                    ok = false;
+                }
+            }
+            int n_std = 0;
+            for (int s = 0; s < NC; s++) n_std += IS_CLUE_CELL[s];
+            if (n_hunt != n_std) {
+                printf("selftest FAIL: scan-orient %d clue count %d != %d\n", k, n_hunt, n_std);
+                ok = false;
+            }
+        }
+        cfg.scan_orient = so_save;
+        init_scan_orient();
         printf("selftest %s (base score %d/480)\n", ok ? "PASS" : "FAIL", s0);
         return ok ? 0 : 1;
     }
@@ -3239,18 +3885,30 @@ int main(int argc, char** argv) {
         Rng rng((u64)std::chrono::high_resolution_clock::now().time_since_epoch().count());
         auto* bs = new BandSolver();
         int rc = 0;
+        int y0_max = std::max(cfg.band_y0_min, cfg.band_y0_max);
         while (!g_stop.load()) {
             for (int orient = 0; orient < 4 && !g_stop.load() && !rc; orient++)
-                for (int y0 = cfg.band_y0_min; y0 <= 12 && !g_stop.load() && !rc; y0++) {
+                for (int y0 = cfg.band_y0_min; y0 <= y0_max && !g_stop.load() && !rc; y0++) {
                     Board rb = rotate_board(B, orient);
                     bool frozen[NC] = {};
                     for (int s = 0; s < NC; s++)
                         if (IS_CLUE_CELL[s]) frozen[rotate_cell(s, orient)] = true;
+                    auto t0 = std::chrono::steady_clock::now();
                     int imp = bs->solve(rb, y0, frozen, cfg.band_node_cap, rng.next());
+                    long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - t0).count();
+                    static const char* MITM_ST[5] = {"", "decided", "bail-mem",
+                                                     "bail-nodes", "replay-FAIL"};
                     printf("[band] orient=%d y0=%d free=%d inc_cost=%d best_cost=%d "
-                           "nodes=%llu imp=%d\n",
+                           "nodes=%llu imp=%d decided=%d ms=%lld",
                            orient, y0, bs->last_n_free, bs->last_incumbent_cost,
-                           bs->last_best_cost, (unsigned long long)bs->last_nodes, imp);
+                           bs->last_best_cost, (unsigned long long)bs->last_nodes, imp,
+                           (int)bs->last_decided, ms);
+                    if (bs->last_mitm)
+                        printf(" mitm=%s tab=%llu joins=%llu", MITM_ST[bs->last_mitm],
+                               (unsigned long long)bs->last_mitm_tab,
+                               (unsigned long long)bs->last_mitm_joins);
+                    printf("\n");
                     fflush(stdout);
                     if (imp > 0) {
                         Board nb = rotate_board(rb, (4 - orient) & 3);
@@ -3318,10 +3976,15 @@ int main(int argc, char** argv) {
     u64 frs = g_restarts.load();
     u64 fhc = g_hybrid.load();
     printf("final best %d/480 restarts=%llu avgdepth=%llu maxdepth=%d "
-           "hyb=%llu hybavg=%.1f\n",
+           "hyb=%llu hybavg=%.1f",
            g_best_score.load(), (unsigned long long)frs,
            (unsigned long long)(frs ? g_depth_sum.load() / frs : 0),
            g_depth_max.load(), (unsigned long long)fhc,
            fhc ? (double)g_hyb_score_sum.load() / (double)fhc : 0.0);
+    if (cfg.ring_filter > 0)
+        printf(" rings=%llu rerolls=%llu",
+               (unsigned long long)g_rings.load(),
+               (unsigned long long)g_ring_rerolls.load());
+    printf("\n");
     return 0;
 }

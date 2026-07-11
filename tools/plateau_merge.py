@@ -21,17 +21,27 @@ drifted apart typically disagree only on a small "disagreement set" of cells
      restricted to the window are just that window's own multiset, this is a
      safe, exact, strict full-board improvement test.
   5. On an improved result, re-validates independently via e2lib (score,
-     piece multiset, border) and writes runs/candidate_merge_<score>.txt with
-     the bucas URL.
+     piece multiset, border) and writes runs/candidate_merge_<score>_<hash8>.txt
+     with the bucas URL (hash8 = md5 prefix of the edges, so distinct
+     same-score boards -- the point of plateau harvesting -- never clobber).
 
 Dedupe: a fingerprint of each solved pair (hash of both edge strings, order
 independent) is cached in <dir>/.plateau_merge.state (newline-delimited JSON,
 same convention as window_sweep.py's sweep state file) so repeated --loop
 invocations do not re-solve the same pair.
 
+--include FILE (repeatable) adds a board from a solver best file (the
+save_board format written to runs*/best_c*.txt: '# ...' header, piece:rot
+grid, bare 1024-char edges line, bucas URL -- or any file containing either
+of the last two) to the snapshot pool, so the current best board itself gets
+paired against its drift snapshots. Its score is computed via e2lib, not
+trusted from the file. scripts/merge.ps1 is the launcher wrapping this.
+
 Usage (from tools/, or anywhere -- paths are resolved via e2lib.ROOT):
   python plateau_merge.py --dir ../runs/drift --clues 5 --time 600 --workers 16
   python plateau_merge.py --dir ../runs/drift --clues 5 --loop
+  python plateau_merge.py --dir ../runs_scratch/drift --clues 5 \
+      --include ../runs_scratch/best_c5.txt
 """
 
 import argparse
@@ -70,6 +80,28 @@ def load_snapshots(drift_dir):
                     continue
                 out.append((score, edges, src))
     return out
+
+
+def load_include(path):
+    """Load one board from a solver best file (save_board format) or any file
+    containing a bare 1024-char edges line or a bucas URL. Returns a
+    (score, edges, src) tuple shaped like a drift snapshot; the score is
+    recomputed via e2lib rather than trusted from the file."""
+    edges = None
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if len(line) == NC * 4 and line.isalpha():
+                edges = line
+                break
+            if "board_edges=" in line:
+                edges = e2lib.parse_url(line)["board_edges"]
+                break
+    if edges is None or len(edges) != NC * 4:
+        raise SystemExit(f"--include {path}: no {NC * 4}-char edges line or "
+                         f"bucas URL found")
+    score, _conflicts, _border_errors = e2lib.score_edges(edges)
+    return score, edges, os.path.basename(path)
 
 
 def disagreement_cells(edges_a, edges_b):
@@ -135,6 +167,10 @@ def build_pairs(snapshots, max_window):
 
 def run_once(args, clue_map):
     snapshots = load_snapshots(args.dir)
+    for path in args.include:
+        score, edges, src = load_include(path)
+        print(f"[plateau_merge] --include {path}: score {score}")
+        snapshots.append((score, edges, src))
     if not snapshots:
         print(f"[plateau_merge] no snapshot lines found in {args.dir}")
         return 0
@@ -178,8 +214,11 @@ def run_once(args, clue_map):
             else:
                 n_improved += 1
                 url = e2lib.build_url(new_edges, name="E2Solver", data=data)
+                # fingerprint suffix: distinct same-score boards are the whole
+                # point of plateau harvesting -- don't clobber them
+                bh = hashlib.md5(new_edges.encode()).hexdigest()[:8]
                 out_path = os.path.join(e2lib.ROOT, "runs",
-                                         f"candidate_merge_{s1}.txt")
+                                         f"candidate_merge_{s1}_{bh}.txt")
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(f"# plateau_merge improvement {score} -> {s1} "
                             f"(pair {sa}<->{sb}, disagreement {ndiff} cells)\n"
@@ -211,6 +250,11 @@ def main():
     ap.add_argument("--max-window", type=int, default=45,
                     help="skip pairs whose disagreement set exceeds this "
                          "many cells (undecidable in practice)")
+    ap.add_argument("--include", action="append", default=[],
+                    help="also add this board file (solver best_c*.txt "
+                         "format, or any file with a bare edges line or "
+                         "bucas URL) to the snapshot pool; repeatable; "
+                         "re-read every pass under --loop")
     ap.add_argument("--loop", action="store_true",
                     help="re-run continuously, picking up new drift "
                          "snapshots each pass; dedupe state persists "
