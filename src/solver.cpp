@@ -26,6 +26,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -138,6 +139,18 @@ struct Config {
     double slip_span = 0.30;
     std::string abort_points;        // adaptive restart aborts "nodes:mindepth,..."
     int tail_cols = 0;               // last N interior rows scanned column-wise
+    // --- ACTUARY pipeline (raphael-anjou vol-216: joint order+slip DP) ---
+    std::string fitstats;            // per-(depth,slips) fit-rate capture file
+    std::string slip_gates_str;      // explicit cumulative slip unlock depths
+                                     // "d1,d2,..." overriding the sqrt schedule
+    // piece-theft ordering guard (WATERSHED/LODESTONE): candidates whose
+    // piece is the unique server of some (W,N) exact demand sort later by
+    // alpha per uniquely-served demand. 0 = off (default behavior).
+    double theft_guard = 0;
+    // forbid a mismatch placement orthogonally adjacent to an existing
+    // mismatch (Blackwood msg 10051 discipline; the v3 464 board has zero
+    // double-breaks). Hunter DFS only; greedy/hybrid tails unaffected.
+    bool no_adj_breaks = false;
     // --mode make-groups parameters
     int group_size = 98;             // good-group size (of 196 interior pieces)
     int groups_n = 60;               // groups to generate
@@ -290,6 +303,52 @@ static bool load_groups(const std::string& path) {
 // adaptive restart aborts (LV's factor-5): sorted (nodes, min max_depth)
 // milestones; a restart whose deepest depth lags the milestone is killed
 static std::vector<std::pair<u64, int>> g_abort_ms;
+
+// explicit slip gate depths (--slip-gates), sorted ascending; overrides the
+// sqrt schedule when non-empty. Gate k at depth g means the k-th cumulative
+// mismatch unlocks once the scan reaches index g.
+static std::vector<int> g_slip_gates;
+
+// fitstats (ACTUARY item 1a): per-(scan depth, slips spent) fit-rate capture
+// for the offline order+slip DP in tools/actuary.py. Threads accumulate into
+// a heap-local copy (hot path stays lock-free) merged under g_fs_mu at
+// thread exit; availability scans run on 1-in-8 sampled node expansions.
+static constexpr int FS_D = 200, FS_S = 64;
+struct FitStats {
+    u64 visits[FS_D][FS_S];       // dfs() expansions at (d, cost)
+    u64 samples[FS_D][FS_S];      // expansions with availability counted
+    u64 avail_exact[FS_D][FS_S];  // unused exact-fit candidates (sampled)
+    u64 avail_half[FS_D][FS_S];   // unused one-mismatch candidates (sampled)
+    u64 child_exact[FS_D][FS_S];  // recursions with placement cost 0
+    u64 child_half[FS_D][FS_S];   // recursions with placement cost >= 1
+    u64 surv[FS_D + 1];           // restarts by max_depth reached
+    u64 restarts, completions;
+};
+static FitStats g_fs;
+static std::mutex g_fs_mu;
+static bool g_fs_on = false;
+
+// cumulative per-depth mismatch caps: explicit --slip-gates when given, else
+// the LV-shaped sqrt spacing from --slip-target/--slip-span. Fills caps[0..
+// n_scan) and returns the total slip count T (the budget clamp).
+static int build_slip_caps(int n_scan, int* caps) {
+    for (int d = 0; d < n_scan; d++) caps[d] = 0;
+    if (!g_slip_gates.empty()) {
+        for (int g : g_slip_gates)
+            for (int d = std::min(std::max(g, 0), n_scan - 1); d < n_scan; d++)
+                caps[d]++;
+        return (int)g_slip_gates.size();
+    }
+    int T = MAX_SCORE - cfg.slip_target;
+    int span = std::min(n_scan, std::max(T, (int)(cfg.slip_span * n_scan)));
+    int d0 = n_scan - span;
+    int rise = std::max(1, span - std::max(4, span / 10));
+    for (int k = 1; k <= T; k++) {
+        int dk = d0 + (int)std::lround(rise * std::sqrt((k - 1) / (double)T));
+        for (int d = std::min(dk, n_scan - 1); d < n_scan; d++) caps[d]++;
+    }
+    return T;
+}
 
 static void init_static(int nclues) {
     for (int p = 0; p < 256; p++) {
@@ -693,6 +752,26 @@ struct Buckets {
             znorm(m);
             for (size_t i = 0; i < n; i++) base[i] += m[i];
         }
+        if (cfg.theft_guard > 0) {
+            // piece-theft guard (WATERSHED/LODESTONE): ~90% of DFS deaths are
+            // a (W,N) demand whose unique serving piece was spent elsewhere.
+            // Softly sort unique servers later so interchangeable pieces are
+            // consumed first; not z-normed on purpose -- alpha is an absolute
+            // nudge against the ~unit-variance rarity/model components.
+            int srv[23][23];  // -1 none, -2 multiple pieces, else unique piece
+            for (auto& row : srv) for (int& v : row) v = -1;
+            for (u32 v : all) {
+                int& e = srv[CW(v)][CN(v)];
+                if (e == -1) e = CP(v);
+                else if (e != CP(v)) e = -2;
+            }
+            float uniq[256] = {};
+            for (int w = 0; w < 23; w++)
+                for (int nn = 0; nn < 23; nn++)
+                    if (srv[w][nn] >= 0) uniq[srv[w][nn]] += 1.f;
+            for (size_t i = 0; i < n; i++)
+                base[i] -= (float)cfg.theft_guard * uniq[CP(all[i])];
+        }
         if (pcls) {
             // class-priority ordering (LV good groups as value ordering):
             // useless > bad > good > precious, dominant over other components
@@ -764,8 +843,37 @@ struct Hunter {
     bool slip_on = false;    // graded cumulative mismatch schedule
     int slip_cap_arr[200];   // max total cost after placing scan[d]
     int ms_idx = 0;          // next adaptive-abort milestone in g_abort_ms
+    // fitstats (ACTUARY): heap-local counters, merged into g_fs at thread
+    // exit so the hot path never touches shared state
+    std::unique_ptr<FitStats> fs;
+    u64 fs_tick = 0;
+    // no-adjacent-breaks: per-cell incident-mismatch count, maintained by
+    // place/unplace only when the flag is on
+    bool nab_on = false;
+    u8 bcnt[NC];
 
-    explicit Hunter(u64 seed) : rng(seed) { log_on = !cfg.log_placements.empty(); }
+    explicit Hunter(u64 seed) : rng(seed) {
+        log_on = !cfg.log_placements.empty();
+        nab_on = cfg.no_adj_breaks;
+        memset(bcnt, 0, sizeof bcnt);
+        if (g_fs_on) fs.reset(new FitStats());
+    }
+    ~Hunter() {
+        if (!fs) return;
+        std::lock_guard<std::mutex> lk(g_fs_mu);
+        for (int d = 0; d < FS_D; d++)
+            for (int s = 0; s < FS_S; s++) {
+                g_fs.visits[d][s] += fs->visits[d][s];
+                g_fs.samples[d][s] += fs->samples[d][s];
+                g_fs.avail_exact[d][s] += fs->avail_exact[d][s];
+                g_fs.avail_half[d][s] += fs->avail_half[d][s];
+                g_fs.child_exact[d][s] += fs->child_exact[d][s];
+                g_fs.child_half[d][s] += fs->child_half[d][s];
+            }
+        for (int d = 0; d <= FS_D; d++) g_fs.surv[d] += fs->surv[d];
+        g_fs.restarts += fs->restarts;
+        g_fs.completions += fs->completions;
+    }
 
     void bump_D(int c, int dv) {
         int before = std::max(0, D[c] - avail[c]);
@@ -793,7 +901,10 @@ struct Hunter {
             int opp = (dir + 2) & 3;
             if (b.filled[ns]) {
                 u8 other = b.q(ns)[opp];
-                if (other != q[dir]) cost++;
+                if (other != q[dir]) {
+                    cost++;
+                    if (nab_on) { bcnt[s]++; bcnt[ns]++; }
+                }
                 bump_D(other, -1);
             } else {
                 bump_D(q[dir], +1);
@@ -811,8 +922,12 @@ struct Hunter {
         for (int dir = 0; dir < 4; dir++) {
             int ns = (s / W + DY[dir]) * W + s % W + DX[dir];
             int opp = (dir + 2) & 3;
-            if (b.filled[ns]) bump_D(b.q(ns)[opp], +1);
-            else bump_D(q[dir], -1);
+            if (b.filled[ns]) {
+                bump_D(b.q(ns)[opp], +1);
+                // filled-neighbor set here matches place() time (deeper
+                // placements have been unwound), so this exactly undoes it
+                if (nab_on && b.q(ns)[opp] != q[dir]) { bcnt[s]--; bcnt[ns]--; }
+            } else bump_D(q[dir], -1);
         }
         used[p] = false;
     }
@@ -884,23 +999,13 @@ struct Hunter {
         int cur_best = g_best_score.load(std::memory_order_relaxed);
         int best_m = cur_best < 0 ? 1 << 20 : MAX_SCORE - cur_best;
         budget = std::min(cfg.budget_cap, best_m + cfg.seed_slack);
-        // graded slip schedule: cap k (k=1..T) unlocks at a sqrt-spaced depth
-        // in the slip zone -- gaps shrink toward the end (LV's shape), and the
-        // last ~span/10 cells get no new slips, mirroring his final-16 hold.
-        slip_on = cfg.slip_target > 0;
-        if (slip_on) {
-            int T = MAX_SCORE - cfg.slip_target;
-            budget = std::min(budget, T);
-            int span = std::min(n_scan, std::max(T, (int)(cfg.slip_span * n_scan)));
-            int d0 = n_scan - span;
-            int rise = std::max(1, span - std::max(4, span / 10));
-            for (int d = 0; d < n_scan; d++) slip_cap_arr[d] = 0;
-            for (int k = 1; k <= T; k++) {
-                int dk = d0 + (int)std::lround(rise * std::sqrt((k - 1) / (double)T));
-                for (int d = std::min(dk, n_scan - 1); d < n_scan; d++)
-                    slip_cap_arr[d]++;
-            }
-        }
+        // graded slip schedule: explicit --slip-gates, else cap k (k=1..T)
+        // unlocks at a sqrt-spaced depth in the slip zone -- gaps shrink
+        // toward the end (LV's shape), and the last ~span/10 cells get no new
+        // slips, mirroring his final-16 hold.
+        slip_on = cfg.slip_target > 0 || !g_slip_gates.empty();
+        if (slip_on) budget = std::min(budget, build_slip_caps(n_scan, slip_cap_arr));
+        if (nab_on) memset(bcnt, 0, sizeof bcnt);
         ms_idx = 0;
         nodes = 0;
         node_cap = cfg.node_cap;
@@ -911,6 +1016,7 @@ struct Hunter {
         if (g_stop.load(std::memory_order_relaxed)) return;
         if (d == n_scan) {
             g_completions.fetch_add(1, std::memory_order_relaxed);
+            if (fs) fs->completions++;
             report_completion(b);
             // anytime B&B: within this restart only accept strictly better
             budget = std::min(budget, cost - 1);
@@ -931,9 +1037,28 @@ struct Hunter {
         int ncol = b.q(s - W)[2];   // north neighbor's south side
         bool pre = !slip_on && (s / W) < free_row;
         int bb = bk.n_bands == 1 ? 0 : ZONE_BAND[s];
+        int fcs = cost < FS_S ? cost : FS_S - 1;  // fitstats slips-spent index
+        if (fs) {
+            fs->visits[d][fcs]++;
+            if ((++fs_tick & 7) == 0) {  // sampled availability scan
+                fs->samples[d][fcs]++;
+                u64 ae = 0, ah = 0;
+                for (u32 v : bk.exact[bb][wcol][ncol]) ae += !used[CP(v)];
+                for (u32 v : bk.by_w[bb][wcol])
+                    ah += !used[CP(v)] && (int)CN(v) != ncol;
+                for (u32 v : bk.by_n[bb][ncol])
+                    ah += !used[CP(v)] && (int)CW(v) != wcol;
+                fs->avail_exact[d][fcs] += ae;
+                fs->avail_half[d][fcs] += ah;
+            }
+        }
 
         auto try_list = [&](const std::vector<u32>& list, bool skip_exact_n,
                             bool skip_exact_w) {
+            // no-adjacent-breaks: neighbors' incident-mismatch counts are
+            // invariant across this loop's place/unplace pairs, so hoist
+            bool adj_break = nab_on && (bcnt[s - 1] || bcnt[s + 1] ||
+                                        bcnt[s - W] || bcnt[s + W]);
             for (u32 v : list) {
                 int cp = CP(v);
                 if (used[cp]) continue;
@@ -967,10 +1092,12 @@ struct Hunter {
                 int c = place(s, cp, CR(v));
                 if (cost + c + deficit > budget ||
                     (slip_on ? cost + c > slip_cap_arr[d]
-                             : (pre && cost_pre + c > cfg.pre_budget))) {
+                             : (pre && cost_pre + c > cfg.pre_budget)) ||
+                    (c > 0 && adj_break)) {
                     unplace(s);
                     continue;
                 }
+                if (fs) (c == 0 ? fs->child_exact : fs->child_half)[d][fcs]++;
                 if (log_on) {
                     lp_cell[d] = (u16)s; lp_p[d] = (u8)cp; lp_r[d] = (u8)CR(v);
                     lp_w[d] = (u8)wcol; lp_n[d] = (u8)ncol;
@@ -1034,6 +1161,10 @@ struct Hunter {
             greedy_fill(max_depth);
             g_hybrid.fetch_add(1, std::memory_order_relaxed);
             report_completion(b);
+        }
+        if (fs) {
+            fs->restarts++;
+            fs->surv[max_depth <= FS_D ? max_depth : FS_D]++;
         }
         g_nodes.fetch_add(nodes, std::memory_order_relaxed);
         g_restarts.fetch_add(1, std::memory_order_relaxed);
@@ -2790,6 +2921,37 @@ static void mix_thread(u64 seed, int id) {
     }
 }
 
+// fitstats dump (ACTUARY item 1a): consumed by tools/actuary.py
+static void dump_fitstats() {
+    std::ofstream f(cfg.fitstats, std::ios::trunc);
+    int n_scan = 0;
+    for (int s = 0; s < NC; s++)
+        if (CELL_TYPE[s] == 0 && !IS_CLUE_CELL[s]) n_scan++;
+    f << "# fitstats clues=" << cfg.clues << " order=" << cfg.order
+      << " slip_target=" << cfg.slip_target << " slip_span=" << cfg.slip_span
+      << " tail_cols=" << cfg.tail_cols << " n_scan=" << n_scan
+      << " sample_shift=3\n";
+    int caps[200] = {};
+    int T = (cfg.slip_target > 0 || !g_slip_gates.empty())
+                ? build_slip_caps(n_scan, caps) : 0;
+    f << "CAPS " << T;
+    for (int d = 0; d < n_scan; d++) f << ' ' << caps[d];
+    f << "\n";
+    f << "R " << g_fs.restarts << ' ' << g_fs.completions << "\n";
+    for (int d = 0; d <= FS_D; d++)
+        if (g_fs.surv[d]) f << "S " << d << ' ' << g_fs.surv[d] << "\n";
+    for (int d = 0; d < FS_D; d++)
+        for (int s = 0; s < FS_S; s++)
+            if (g_fs.visits[d][s])
+                f << "D " << d << ' ' << s << ' ' << g_fs.visits[d][s] << ' '
+                  << g_fs.samples[d][s] << ' ' << g_fs.avail_exact[d][s] << ' '
+                  << g_fs.avail_half[d][s] << ' ' << g_fs.child_exact[d][s]
+                  << ' ' << g_fs.child_half[d][s] << "\n";
+    printf("fitstats: %llu restarts, %llu completions -> %s\n",
+           (unsigned long long)g_fs.restarts,
+           (unsigned long long)g_fs.completions, cfg.fitstats.c_str());
+}
+
 static void status_thread() {
     auto t0 = std::chrono::steady_clock::now();
     u64 last_nodes = 0;
@@ -2881,6 +3043,10 @@ int main(int argc, char** argv) {
         }
         else if (a == "--slip-target") cfg.slip_target = std::stoi(next());
         else if (a == "--slip-span") cfg.slip_span = std::stod(next());
+        else if (a == "--slip-gates") cfg.slip_gates_str = next();
+        else if (a == "--fitstats") cfg.fitstats = next();
+        else if (a == "--theft-guard") cfg.theft_guard = std::stod(next());
+        else if (a == "--no-adjacent-breaks") cfg.no_adj_breaks = std::stoi(next()) != 0;
         else if (a == "--abort-points") cfg.abort_points = next();
         else if (a == "--tail-cols") cfg.tail_cols = std::max(0, std::min(10, std::stoi(next())));
         else if (a == "--group-size") cfg.group_size = std::stoi(next());
@@ -2925,6 +3091,20 @@ int main(int argc, char** argv) {
         printf("ERROR: cannot load groups file %s\n", cfg.groups_file.c_str());
         return 1;
     }
+    if (!cfg.slip_gates_str.empty()) {
+        const char* s = cfg.slip_gates_str.c_str();
+        while (*s) {
+            char* e;
+            long d = strtol(s, &e, 10);
+            if (e == s) { printf("ERROR: --slip-gates wants d1,d2,...\n"); return 1; }
+            g_slip_gates.push_back((int)d);
+            if (*e == ',') s = e + 1;
+            else if (*e == 0) s = e;
+            else { printf("ERROR: --slip-gates wants d1,d2,...\n"); return 1; }
+        }
+        std::sort(g_slip_gates.begin(), g_slip_gates.end());
+    }
+    g_fs_on = !cfg.fitstats.empty();
     if (!cfg.abort_points.empty()) {
         const char* s = cfg.abort_points.c_str();
         while (*s) {
@@ -2951,6 +3131,12 @@ int main(int argc, char** argv) {
     if (cfg.slip_target > 0)
         printf("slip: target %d (T=%d) span=%.2f\n", cfg.slip_target,
                MAX_SCORE - cfg.slip_target, cfg.slip_span);
+    if (!g_slip_gates.empty())
+        printf("slip gates: %zu explicit unlocks (first %d, last %d) override sqrt\n",
+               g_slip_gates.size(), g_slip_gates.front(), g_slip_gates.back());
+    if (cfg.theft_guard > 0)
+        printf("theft guard: alpha=%.4f\n", cfg.theft_guard);
+    if (cfg.no_adj_breaks) printf("no-adjacent-breaks: on\n");
     if (!g_abort_ms.empty())
         printf("abort points: %zu milestones\n", g_abort_ms.size());
     if (cfg.tail_cols > 0)
@@ -3118,6 +3304,7 @@ int main(int argc, char** argv) {
         });
     status_thread();  // runs until g_stop
     for (auto& t : ts) t.join();
+    if (g_fs_on) dump_fitstats();
     u64 frs = g_restarts.load();
     printf("final best %d/480 restarts=%llu avgdepth=%llu maxdepth=%d\n",
            g_best_score.load(), (unsigned long long)frs,
