@@ -100,6 +100,11 @@ struct Config {
     // and greedy-fills the rest, so restarts always emit a fresh-lineage
     // board (~perfect top rows + greedy tail) instead of nothing.
     bool hybrid = true;              // --hybrid 0/1
+    int hybrid_min_depth = 0;        // emit the hybrid only when the restart's
+                                     // deepest prefix reached this many interior
+                                     // cells (0 = every restart; under slip most
+                                     // restarts die at depth ~4 and their hybrids
+                                     // are greedy-quality pool flooding)
     int tie_pct = 100;               // % of equal-score LNS results applied
                                      // (sideways drift speed; 30 = old behavior)
     int merge_pct = 2;               // % of polish steps: exact plateau merge
@@ -533,7 +538,8 @@ static std::atomic<u64> g_nodes{0}, g_restarts{0}, g_completions{0},
     g_polish_iters{0}, g_polish_gains{0}, g_depth_sum{0},
     g_scatter_iters{0}, g_scatter_gains{0}, g_umbrella_jumps{0},
     g_region_tieproof{0}, g_parity_iters{0}, g_parity_gains{0},
-    g_hybrid{0}, g_merge_iters{0}, g_merge_gains{0}, g_aborts{0};
+    g_hybrid{0}, g_hyb_score_sum{0}, g_merge_iters{0}, g_merge_gains{0},
+    g_aborts{0};
 static std::atomic<int> g_depth_max{0};
 static std::atomic<bool> g_stop{false};
 static std::mutex g_log_mu;
@@ -1154,12 +1160,13 @@ struct Hunter {
         // the tail -> every restart emits a fresh-lineage completion
         // (perfect ring + ~perfect top rows + greedy bottom), typically well
         // above a from-scratch greedy_complete board.
-        if (cfg.hybrid && max_depth > 0 &&
+        if (cfg.hybrid && max_depth > 0 && max_depth >= cfg.hybrid_min_depth &&
             !g_stop.load(std::memory_order_relaxed)) {
             for (int i = 0; i < max_depth; i++)
                 place(scan[i], hyb_p[i], hyb_r[i]);
             greedy_fill(max_depth);
             g_hybrid.fetch_add(1, std::memory_order_relaxed);
+            g_hyb_score_sum.fetch_add((u64)b.score(), std::memory_order_relaxed);
             report_completion(b);
         }
         if (fs) {
@@ -2961,15 +2968,17 @@ static void status_thread() {
                       std::chrono::steady_clock::now() - t0).count();
         u64 n = g_nodes.load();
         u64 rs = g_restarts.load();
+        u64 hc = g_hybrid.load();
         printf("[%6llds] best=%d/480 restarts=%llu avgdepth=%llu maxdepth=%d "
-               "completions=%llu hyb=%llu ab=%llu nodes=%.2fB (%.1fM/s) polish=%llu(+%llu) "
+               "completions=%llu hyb=%llu hybavg=%.1f ab=%llu nodes=%.2fB (%.1fM/s) polish=%llu(+%llu) "
                "seeds=%zu fresh=%zu plat=%zu umbrella=%llu tieproof=%llu "
                "parity=%llu(+%llu) merge=%llu(+%llu)\n",
                (long long)el, g_best_score.load(), (unsigned long long)rs,
                (unsigned long long)(rs ? g_depth_sum.load() / rs : 0),
                g_depth_max.load(),
                (unsigned long long)g_completions.load(),
-               (unsigned long long)g_hybrid.load(),
+               (unsigned long long)hc,
+               hc ? (double)g_hyb_score_sum.load() / (double)hc : 0.0,
                (unsigned long long)g_aborts.load(), n / 1e9,
                (n - last_nodes) / 15.0e6, (unsigned long long)g_polish_iters.load(),
                (unsigned long long)g_polish_gains.load(), g_seeds.size(), g_fresh.size(),
@@ -3023,6 +3032,7 @@ int main(int argc, char** argv) {
         else if (a == "--parity-pct") cfg.parity_pct = std::stoi(next());
         else if (a == "--band-y0-min") cfg.band_y0_min = std::max(1, std::min(12, std::stoi(next())));
         else if (a == "--hybrid") cfg.hybrid = std::stoi(next()) != 0;
+        else if (a == "--hybrid-min-depth") cfg.hybrid_min_depth = std::stoi(next());
         else if (a == "--tie-pct") cfg.tie_pct = std::stoi(next());
         else if (a == "--merge-pct") cfg.merge_pct = std::stoi(next());
         else if (a == "--merge-nodes") cfg.merge_node_cap = std::stoull(next());
@@ -3306,9 +3316,12 @@ int main(int argc, char** argv) {
     for (auto& t : ts) t.join();
     if (g_fs_on) dump_fitstats();
     u64 frs = g_restarts.load();
-    printf("final best %d/480 restarts=%llu avgdepth=%llu maxdepth=%d\n",
+    u64 fhc = g_hybrid.load();
+    printf("final best %d/480 restarts=%llu avgdepth=%llu maxdepth=%d "
+           "hyb=%llu hybavg=%.1f\n",
            g_best_score.load(), (unsigned long long)frs,
            (unsigned long long)(frs ? g_depth_sum.load() / frs : 0),
-           g_depth_max.load());
+           g_depth_max.load(), (unsigned long long)fhc,
+           fhc ? (double)g_hyb_score_sum.load() / (double)fhc : 0.0);
     return 0;
 }

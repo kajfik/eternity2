@@ -448,3 +448,63 @@ clues, grey border; `e2lib.score_edges` = 433). Preserved in
 and the resulting scores can beat hours of resumed polishing; (b) the
 421 plateau was likely a polisher local-optimum artifact, so
 fresh-lineage hunting deserves more of the mix budget than assumed.
+
+## Addendum 2 — hybrid-emission depth gate (`--hybrid-min-depth`), 2026-07-11
+
+**Hypothesis.** Under the graded slip schedule (`--slip-target 460`) most
+restarts die at depth ~4 yet still emit a hybrid completion (~89% of
+restarts), so `g_fresh` (cap 160, random-replace) is flooded with
+greedy-quality boards and the rare deep survivors are mostly evicted.
+Gating emission on a minimum prefix depth should give fewer, better fresh
+boards and better mix scores.
+
+**Implementation.** `--hybrid-min-depth N` (default 0 = old behavior)
+gates the hybrid block in `Hunter::run_restart` on
+`max_depth >= cfg.hybrid_min_depth`; new `hybavg=` in the status/final
+line = mean `Board::score()` of all emitted hybrids (atomic sum/count) —
+a direct food-quality metric independent of the noisy final score.
+
+**Gate calibration** (60 s hunt, 12T, slip-460 + abort-points + model
+order, `--log-placements`; 89k restarts): the restart max-depth
+distribution is a *staircase*, not smooth — ~70% die at depth ≤1, ~29.5%
+plateau across depths 5–13, a cliff to **6.75% at depth 14** (= interior
+row 1 completed), **1.07% at 15**, ~0.2% past row 2, 0.1% at 138+.
+Intermediate keep-fractions don't exist, so the arms were gate 5 (keeps
+~30%, nearest to the 20% target) and gate 14 (keeps ~6.8%, ≈ the 5%
+target).
+
+**A/B** (2.5-min from-scratch mix, 12T, fresh out dir per rep, flags
+`--clues 5 --order model --slip-target 460 --abort-points
+"2000000:60,10000000:120"`, interleaved g0,g5,g14 × 4 reps, machine idle):
+
+| rep | gate 0 | gate 5 | gate 14 | g5−g0 | g14−g0 |
+|---|---|---|---|---|---|
+| 1 | 436 | 444 | 442 | +8 | +6 |
+| 2 | **449** | 441 | 445 | −8 | −4 |
+| 3 | 442 | 444 | 444 | +2 | +2 |
+| 4 | 443 | 444 | 443 | +1 | 0 |
+| mean | 442.5 | 443.25 | 443.5 | +0.75 | +1.0 |
+
+Secondary metrics (4 reps each, tight): hybavg 381.6 / 383.8 / 385.5;
+emit fraction ~89% / ~26% / ~6% of restarts; maxdepth 166–184 all arms;
+no restart-throughput gain (mix-mode restart counts vary 20k–41k within
+arms — scheduling noise swamps the saved greedy_fills).
+
+**Verdict: NEUTRAL — flag stays opt-in at default 0.** Mean score deltas
+(+0.75 / +1.0) are far below the ±3–4 noise floor; sign tests 3W/1L and
+2W/1L/1T are nothing. The instrumentation explains *why* the hypothesis
+failed: a hybrid's score is dominated by its greedy tail, so a perfect
+14-cell prefix buys only ~4 edges over a 4-cell one (hybavg 381.6→385.5)
+— the fresh pool's mean quality barely moves, and the valuable deep
+survivors were never actually lost: `report_completion` score-gates them
+into `g_seeds` (elite) independently of `g_fresh` eviction. Pool flooding
+was real; its cost wasn't. `hybavg=` stays (cheap, useful).
+
+**Windfalls**: two independent from-scratch **449/480** boards in one day
+(both e2lib-verified: clean multiset, 0 border errors), beating the
+448 project best from 2026-07-10: one from the 60-s *hunt-mode*
+calibration run (`eval/best_c5_449_scratch.txt`), one from the 2.5-min
+mix control arm rep 2 (`eval/best_c5_449_scratch_b.txt`). They agree on
+only 10/256 cells — independent basins, per the known cross-lineage
+5–12-cell overlap. Also note the *hunt-mode* 449 at 60 s: hybrid
+completions make pure hunt mode a competitive from-scratch scorer now.
