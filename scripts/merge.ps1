@@ -53,11 +53,22 @@ if ($snapFiles.Count -eq 0) {
     Write-Host "         Drift files appear once a solver run stalls at/near its best (run.ps1 always passes --drift-dir)."
 }
 
-if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-    throw "python not found on PATH. The offline plateau merge is an OPTIONAL extra (hunts via run.ps1 never need python; the solver has an in-process merge move built in). To use it: install Python 3 + pip install ortools."
+# Probe `python` then the `py` launcher (some installs only have `py`); the
+# cmd /c wrapper keeps a failed import silent and sidesteps PS 5.1's
+# native-stderr wrapping. The Store `python` alias stub fails both probes.
+$python = $null
+$pyProblem = ''
+foreach ($cand in @('python', 'py')) {
+    if (-not (Get-Command $cand -ErrorAction SilentlyContinue)) { continue }
+    cmd /c "$cand -c `"import ortools`" >nul 2>&1"
+    if ($LASTEXITCODE -eq 0) { $python = $cand; break }
+    cmd /c "$cand -c `"import sys`" >nul 2>&1"
+    if ($LASTEXITCODE -eq 0 -and -not $pyProblem) { $pyProblem = "$cand works but ortools is missing: $cand -m pip install ortools" }
 }
-& python -c "import ortools" | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "python found but ortools missing: pip install ortools" }
+if (-not $python) {
+    if (-not $pyProblem) { $pyProblem = "no python found on PATH (tried 'python' and 'py'). The offline plateau merge is an OPTIONAL extra (hunts via run.ps1 never need python; the solver has an in-process merge move built in). To use it: install Python 3, then: py -m pip install ortools." }
+    throw $pyProblem
+}
 
 if (-not (Test-Path $driftDir)) { New-Item -ItemType Directory -Force $driftDir | Out-Null }
 $pyArgs = @('tools\plateau_merge.py',
@@ -66,8 +77,8 @@ $pyArgs = @('tools\plateau_merge.py',
             '--workers', "$Workers", '--max-window', "$MaxWindow",
             '--max-boards', "$MaxBoards")
 if ($Loop) { $pyArgs += '--loop' }
-Write-Host "python $($pyArgs -join ' ')"
-& python @pyArgs
+Write-Host "$python $($pyArgs -join ' ')"
+& $python @pyArgs
 $code = $LASTEXITCODE
 
 $cand = Get-ChildItem (Join-Path $root 'runs') -Filter 'candidate_merge_*.txt' -ErrorAction SilentlyContinue

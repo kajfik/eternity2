@@ -47,15 +47,16 @@
 # -NoSweep to run the solver alone without python).
 #
 # Thread budget: -TotalThreads (or the interactive prompt) sets the budget for
-# all three engines, default = all logical cores; it is split 62/19/19 %
-# solver/merge/sweep (reproduces the tuned 20/6/6 on the 32-thread reference
-# box; 10/3/3 on 16 threads). -SolverThreads/-MergeWorkers/-SweepWorkers
-# override individual slices. CP-SAT workers are bursty, so mild
-# oversubscription is fine; lower the budget if the box feels sluggish.
+# all three engines, default = logical cores - 2 (headroom for the OS and this
+# orchestrator); it is split 62/19/19 % solver/merge/sweep (18/5/5 on the
+# 32-thread reference box; 8/2/2 on 16 threads).
+# -SolverThreads/-MergeWorkers/-SweepWorkers override individual slices.
+# CP-SAT workers are bursty, so mild oversubscription is fine; lower the
+# budget if the box feels sluggish.
 param(
     [int]$Clues = 5,
     [int]$Target = 460,
-    [int]$TotalThreads = 0,    # 0 = all logical cores; the 62/19/19 split divides this budget
+    [int]$TotalThreads = 0,    # 0 = logical cores - 2; the 62/19/19 split divides this budget
     [int]$SolverThreads = 0,   # 0 = auto (~62% of the budget)
     [int]$MergeWorkers = 0,    # 0 = auto (~19%)
     [int]$SweepWorkers = 0,    # 0 = auto (~19%)
@@ -97,7 +98,8 @@ if ($interactive) {
         Write-Host "no $bf yet - the solver starts a fresh from-scratch lineage."
     }
     # thread budget (split 62/19/19 solver/merge/sweep below)
-    do { $sel = Read-Host "Total threads for all three engines [$nCores = all logical cores]" } until ($sel -eq '' -or $sel -match '^\d+$')
+    $defBudget = [Math]::Max(4, $nCores - 2)
+    do { $sel = Read-Host "Total threads for all three engines [$defBudget = logical cores - 2]" } until ($sel -eq '' -or $sel -match '^\d+$')
     if ($sel -ne '') { $TotalThreads = [int]$sel }
     # target score
     do { $sel = Read-Host "Stop at score [$Target]" } until ($sel -eq '' -or $sel -match '^\d+$')
@@ -111,7 +113,7 @@ if ($interactive) {
 }
 
 # --- thread auto-split (see header) -------------------------------------------
-$threadBudget = $nCores
+$threadBudget = [Math]::Max(4, $nCores - 2)
 if ($TotalThreads -gt 0) { $threadBudget = $TotalThreads }
 if ($SolverThreads -le 0) { $SolverThreads = [Math]::Max(2, [int][Math]::Floor($threadBudget * 0.625)) }
 if ($MergeWorkers  -le 0) { $MergeWorkers  = [Math]::Max(2, [int][Math]::Floor($threadBudget * 0.1875)) }
@@ -175,18 +177,28 @@ if (-not (Test-Path $exe)) {
     }
 }
 
-# --- python + ortools (needed by MERGE and SWEEP) ------------------------------
+# --- python + ortools (needed by MERGE and SWEEP). Windows exposes the
+# interpreter as `python` and/or the `py` launcher -- sometimes ONLY `py`
+# (python.org installer without the add-to-PATH option), so probe both and
+# remember which one worked ($Python is what Start-Merge/Start-Sweep launch).
+# Probes go through cmd /c so a failed import stays silent (PS 5.1 wraps native
+# stderr in ErrorRecords, which $ErrorActionPreference=Stop would escalate);
+# the Microsoft Store `python` alias stub fails both probes and falls through. --
+$Python = $null
 $UseMerge = -not $NoMerge
 $UseSweep = -not $NoSweep
 if ($UseMerge -or $UseSweep) {
     $pyProblem = ''
-    if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-        $pyProblem = "python not found on PATH (install Python 3 + 'pip install ortools')"
-    } else {
-        & python -c "import ortools" | Out-Null
-        if ($LASTEXITCODE -ne 0) { $pyProblem = "python found but ortools missing (pip install ortools)" }
+    foreach ($cand in @('python', 'py')) {
+        if (-not (Get-Command $cand -ErrorAction SilentlyContinue)) { continue }
+        cmd /c "$cand -c `"import ortools`" >nul 2>&1"
+        if ($LASTEXITCODE -eq 0) { $Python = $cand; break }
+        # interpreter runs but ortools is missing?
+        cmd /c "$cand -c `"import sys`" >nul 2>&1"
+        if ($LASTEXITCODE -eq 0 -and -not $pyProblem) { $pyProblem = "$cand works but ortools is missing ($cand -m pip install ortools)" }
     }
-    if ($pyProblem) {
+    if (-not $Python) {
+        if (-not $pyProblem) { $pyProblem = "no python found on PATH (tried 'python' and 'py'; install Python 3, then: py -m pip install ortools)" }
         if ($interactive) {
             Write-Host "$pyProblem - the merge/sweep engines need it."
             do { $sel = Read-Host "Run [S]olver-only without them, or [Q]uit to install (s/q) [s]" } until ($sel -eq '' -or $sel -match '^[sqSQ]$')
@@ -247,8 +259,8 @@ function Start-Merge {
            '--loop', '--time', '900', '--time-per-pair', '60',
            '--workers', "$MergeWorkers", '--max-window', '40', '--max-boards', '500')
     $log = Join-Path $LogDir ("merge_{0}.log" -f (Get-Date -Format yyyyMMdd_HHmmss))
-    Log "merge loop: python $(Quote-Args $a)"
-    $script:MergeProc = Start-Process -FilePath python -ArgumentList (Quote-Args $a) `
+    Log "merge loop: $Python $(Quote-Args $a)"
+    $script:MergeProc = Start-Process -FilePath $Python -ArgumentList (Quote-Args $a) `
         -WorkingDirectory $PSScriptRoot -NoNewWindow -PassThru `
         -RedirectStandardOutput $log -RedirectStandardError "$log.err"
 }
@@ -318,7 +330,7 @@ function Start-Sweep($tgt) {
     $script:SweepTargetFile = $tgt.File
     $script:SweepPass = $tgt.Pass
     Log ("sweep: {0} pass {1} ({2}-min chunk, {3} s/window)" -f (Split-Path $tgt.File -Leaf), $tgt.Pass, $SweepChunkMinutes, $tp)
-    $script:SweepProc = Start-Process -FilePath python -ArgumentList (Quote-Args $a) `
+    $script:SweepProc = Start-Process -FilePath $Python -ArgumentList (Quote-Args $a) `
         -WorkingDirectory $PSScriptRoot -NoNewWindow -PassThru `
         -RedirectStandardOutput $script:SweepLog -RedirectStandardError "$($script:SweepLog).err"
 }
