@@ -32,8 +32,13 @@
 # block stops all children. Re-running the script continues where it left off.
 #
 # Usage:
-#   .\push460.ps1                          # defaults: 5 clues, target 460
+#   .\push460.ps1                          # INTERACTIVE: prompts for lineage
+#                                          # (continue/archive), thread budget,
+#                                          # target, minutes, stagnation, and
+#                                          # native-build choice (= push460.cmd)
+#   .\push460.ps1 -Target 460              # any parameter -> scripted, no prompts
 #   .\push460.ps1 -SolverThreads 24        # more solver, less CP-SAT headroom
+#   .\push460.ps1 -TotalThreads 16         # cap the whole pipeline's budget
 #   .\push460.ps1 -Minutes 10              # timed smoke run
 #   .\push460.ps1 -Fresh                   # archive the lineage, start over
 #   .\push460.ps1 -NoSweep                 # solver + merge only (less python load)
@@ -41,15 +46,17 @@
 # Needs python 3 + `pip install ortools` for MERGE/SWEEP (pass -NoMerge
 # -NoSweep to run the solver alone without python).
 #
-# Thread budget: 0 = auto-scale to the machine's logical core count with a
-# 62/19/19 % solver/merge/sweep split (reproduces the tuned 20/6/6 on the
-# 32-thread reference box; 10/3/3 on 16 threads). CP-SAT workers are bursty,
-# so mild oversubscription is fine; drop -SolverThreads if the box feels
-# sluggish.
+# Thread budget: -TotalThreads (or the interactive prompt) sets the budget for
+# all three engines, default = all logical cores; it is split 62/19/19 %
+# solver/merge/sweep (reproduces the tuned 20/6/6 on the 32-thread reference
+# box; 10/3/3 on 16 threads). -SolverThreads/-MergeWorkers/-SweepWorkers
+# override individual slices. CP-SAT workers are bursty, so mild
+# oversubscription is fine; lower the budget if the box feels sluggish.
 param(
     [int]$Clues = 5,
     [int]$Target = 460,
-    [int]$SolverThreads = 0,   # 0 = auto (~62% of logical cores)
+    [int]$TotalThreads = 0,    # 0 = all logical cores; the 62/19/19 split divides this budget
+    [int]$SolverThreads = 0,   # 0 = auto (~62% of the budget)
     [int]$MergeWorkers = 0,    # 0 = auto (~19%)
     [int]$SweepWorkers = 0,    # 0 = auto (~19%)
     [double]$StagnationHours = 2,
@@ -66,11 +73,49 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 . (Join-Path $PSScriptRoot 'scripts\flags.ps1')   # $ScratchArgs (canonical)
 
-# --- thread auto-split (see header) -------------------------------------------
+# --- interactive startup (run.ps1 style): no parameters -> prompt for the
+# choices a run needs; ANY parameter -> scripted mode, no prompts ---------------
+$interactive = ($PSBoundParameters.Count -eq 0)
 $nCores = [Environment]::ProcessorCount
-if ($SolverThreads -le 0) { $SolverThreads = [Math]::Max(2, [int][Math]::Floor($nCores * 0.625)) }
-if ($MergeWorkers  -le 0) { $MergeWorkers  = [Math]::Max(2, [int][Math]::Floor($nCores * 0.1875)) }
-if ($SweepWorkers  -le 0) { $SweepWorkers  = [Math]::Max(2, [int][Math]::Floor($nCores * 0.1875)) }
+if ($interactive) {
+    Write-Host ""
+    Write-Host "push460: from-scratch push to $Target/480 (solver + plateau-merge + CP-SAT sweep)"
+    Write-Host "(Enter accepts the [default] on every prompt)"
+    Write-Host ""
+    # lineage: continue or archive-and-start-fresh
+    $bf = Join-Path $OutDir "best_c$Clues.txt"
+    if (Test-Path $bf) {
+        $sc = ''
+        try {
+            $first = Get-Content $bf -TotalCount 1 -ErrorAction Stop
+            if ($first -match 'score=(\d+)/480') { $sc = " at $($Matches[1])/480" }
+        } catch {}
+        Write-Host "$bf exists$sc."
+        do { $sel = Read-Host "[C]ontinue that lineage or [A]rchive it and start truly fresh (c/a) [c]" } until ($sel -eq '' -or $sel -match '^[caCA]$')
+        if ($sel -match '^[aA]$') { $Fresh = $true }
+    } else {
+        Write-Host "no $bf yet - the solver starts a fresh from-scratch lineage."
+    }
+    # thread budget (split 62/19/19 solver/merge/sweep below)
+    do { $sel = Read-Host "Total threads for all three engines [$nCores = all logical cores]" } until ($sel -eq '' -or $sel -match '^\d+$')
+    if ($sel -ne '') { $TotalThreads = [int]$sel }
+    # target score
+    do { $sel = Read-Host "Stop at score [$Target]" } until ($sel -eq '' -or $sel -match '^\d+$')
+    if ($sel -ne '') { $Target = [int]$sel }
+    # wall-clock cap
+    do { $sel = Read-Host "Minutes [run until Ctrl+C or target]" } until ($sel -eq '' -or $sel -match '^\d+(\.\d+)?$')
+    if ($sel -ne '') { $Minutes = [double]$sel }
+    # stagnation restart (solver only; merge/sweep keep their own state)
+    do { $sel = Read-Host "Restart the solver after hours without a new best (0 = never) [$StagnationHours]" } until ($sel -eq '' -or $sel -match '^\d+(\.\d+)?$')
+    if ($sel -ne '') { $StagnationHours = [double]$sel }
+}
+
+# --- thread auto-split (see header) -------------------------------------------
+$threadBudget = $nCores
+if ($TotalThreads -gt 0) { $threadBudget = $TotalThreads }
+if ($SolverThreads -le 0) { $SolverThreads = [Math]::Max(2, [int][Math]::Floor($threadBudget * 0.625)) }
+if ($MergeWorkers  -le 0) { $MergeWorkers  = [Math]::Max(2, [int][Math]::Floor($threadBudget * 0.1875)) }
+if ($SweepWorkers  -le 0) { $SweepWorkers  = [Math]::Max(2, [int][Math]::Floor($threadBudget * 0.1875)) }
 
 # --- paths -------------------------------------------------------------------
 New-Item -ItemType Directory -Force $OutDir | Out-Null
@@ -107,15 +152,26 @@ if ($Fresh) {
 # they belong to the archived basin and would out-score the new one instantly)
 if ($Fresh) { $CandidateCutoff = Get-Date } else { $CandidateCutoff = [datetime]::MinValue }
 
-# --- solver exe (same preference order as run.ps1) -----------------------------
+# --- solver exe (same preference order as run.ps1: native solver.exe -> build
+# it -> committed portable bin\solver.exe). Interactive runs get a choice when
+# there is no native exe yet ----------------------------------------------------
 $exe = Join-Path $PSScriptRoot 'solver.exe'
 if (-not (Test-Path $exe)) {
-    Log "solver.exe not found - trying a native build via scripts\build.ps1 ..."
-    try { & "$PSScriptRoot\scripts\build.ps1" } catch { Log "build unavailable: $_" }
+    $portable = Join-Path $PSScriptRoot 'bin\solver.exe'
+    $tryBuild = $true
+    if ($interactive -and (Test-Path $portable)) {
+        Write-Host "no native solver.exe on this machine."
+        do { $sel = Read-Host "[B]uild it with g++ (machine-tuned, needs a toolchain) or use the committed [P]ortable bin\solver.exe (b/p) [b]" } until ($sel -eq '' -or $sel -match '^[bpBP]$')
+        $tryBuild = ($sel -notmatch '^[pP]$')
+    }
+    if ($tryBuild) {
+        Log "trying a native build via scripts\build.ps1 ..."
+        try { & "$PSScriptRoot\scripts\build.ps1" } catch { Log "build unavailable: $_" }
+    }
     if (-not (Test-Path $exe)) {
-        $exe = Join-Path $PSScriptRoot 'bin\solver.exe'
-        if (-not (Test-Path $exe)) { throw "no solver exe: run scripts\build.ps1 or restore bin\solver.exe" }
-        Log "using portable bin\solver.exe"
+        $exe = $portable
+        if (-not (Test-Path $exe)) { throw "no solver exe: install g++ and run scripts\build.ps1, or restore bin\solver.exe from the repo" }
+        Log "using portable bin\solver.exe (x86-64-v3; needs an AVX2 CPU, ~2015+)"
     }
 }
 
@@ -123,11 +179,24 @@ if (-not (Test-Path $exe)) {
 $UseMerge = -not $NoMerge
 $UseSweep = -not $NoSweep
 if ($UseMerge -or $UseSweep) {
+    $pyProblem = ''
     if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-        throw "python not found on PATH (needed for merge/sweep). Install Python 3 + 'pip install ortools', or pass -NoMerge -NoSweep."
+        $pyProblem = "python not found on PATH (install Python 3 + 'pip install ortools')"
+    } else {
+        & python -c "import ortools" | Out-Null
+        if ($LASTEXITCODE -ne 0) { $pyProblem = "python found but ortools missing (pip install ortools)" }
     }
-    & python -c "import ortools" | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "python found but ortools missing: pip install ortools (or pass -NoMerge -NoSweep)" }
+    if ($pyProblem) {
+        if ($interactive) {
+            Write-Host "$pyProblem - the merge/sweep engines need it."
+            do { $sel = Read-Host "Run [S]olver-only without them, or [Q]uit to install (s/q) [s]" } until ($sel -eq '' -or $sel -match '^[sqSQ]$')
+            if ($sel -match '^[qQ]$') { exit 1 }
+            $UseMerge = $false; $UseSweep = $false
+            Log "merge/sweep disabled for this run (solver-only)"
+        } else {
+            throw "$pyProblem - needed for merge/sweep; or pass -NoMerge -NoSweep."
+        }
+    }
 }
 
 # --- helpers -------------------------------------------------------------------
@@ -311,7 +380,7 @@ $startScore = Get-BestScore
 if ($startScore -ge 0) { Log "resuming lineage: best $startScore/480 ($BestFile)" }
 else { Log "no best file yet - the solver starts a fresh from-scratch lineage" }
 Log "target: $Target/480 | drift cap $DriftCap/thread | stagnation restart after $StagnationHours h"
-Log "threads ($nCores logical cores): solver $SolverThreads | merge $MergeWorkers | sweep $SweepWorkers"
+Log "threads (budget $threadBudget, $nCores logical cores): solver $SolverThreads | merge $MergeWorkers | sweep $SweepWorkers"
 
 $deadline = $null
 if ($Minutes -gt 0) { $deadline = (Get-Date).AddMinutes($Minutes) }
