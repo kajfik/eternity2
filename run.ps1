@@ -1,5 +1,8 @@
-# Eternity II hunt launcher. Works on a fresh clone: builds solver.exe if
-# missing, then asks (or takes as parameters) everything a run needs.
+# Eternity II hunt launcher. Works on a fresh clone with NO toolchain: builds
+# solver.exe natively if g++ is available, otherwise falls back to the
+# committed portable build bin\solver.exe (x86-64-v3, any AVX2 CPU ~2015+).
+# Asks (or takes as parameters) everything a run needs. Python is never needed
+# for hunts - only for the optional offline plateau merge (scripts\merge.ps1).
 #
 #   from-scratch : fresh lineage in runs_scratch\ (gitignored). Continues the
 #                  previous scratch best if one exists, unless you archive it.
@@ -26,13 +29,8 @@
 # every new best. Console output is copied to <outdir>\run_c<clues>_<ts>.log
 # (plain ASCII bytes via stdout redirect; the old Tee-Object wrote UTF-16).
 #
-# ============================= MAINTENANCE NOTE ==============================
-# The $ScratchArgs / $BestArgs blocks below are the SINGLE SOURCE OF TRUTH for
-# the current best-known flag sets. Claude instances: whenever a new flag
-# configuration is proven better (A/B tested, e2lib-verified), update these
-# blocks and the matching note in CLAUDE.md as part of adopting it. Do not add
-# unproven flags here.
-# =============================================================================
+# The canonical best-known flag sets ($ScratchArgs / $BestArgs) live in
+# scripts\flags.ps1 (shared with push460.ps1) -- see the maintenance note there.
 param(
     [ValidateSet('scratch','best')][string]$Mode,
     [int]$Clues = 0,        # 1 or 5
@@ -47,25 +45,9 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $interactive = -not $PSBoundParameters.ContainsKey('Mode')
 
-# --- best-known flag sets (see maintenance note above) -----------------------
-# From-scratch, proven 2026-07-10/11 (CLAUDE.md "Verhaard adoptions" +
-# theft-guard A/B): graded slip schedule + adaptive restart aborts lift the
-# 90-s from-scratch best from 432 to 444-448. --scan-orient 1 (2026-07-11 A/B,
-# +3.5 mean at 90 s, two all-time 451s) puts the center clue at scan row 7;
-# proven on 5-clue hunts, mechanism-aligned but untested for clues=1.
-$ScratchArgs = @(
-    '--order','model','--model-file','eval\model_weights.txt',
-    '--slip-target','460',
-    '--abort-points','2000000:60,10000000:120',
-    '--scan-orient','1'
-)
-# From-best (record hunts resume a high seed where hunter output is pool
-# food): the long-run-proven set from scripts\run5.ps1 / run1.ps1. Slip is
-# only smoke-tested from scratch, not on resumed record lineages.
-$BestArgs = @(
-    '--order','model','--model-file','eval\model_weights.txt'
-)
-# -----------------------------------------------------------------------------
+# --- best-known flag sets: $ScratchArgs / $BestArgs (single source of truth,
+# shared with push460.ps1) ----------------------------------------------------
+. (Join-Path $PSScriptRoot 'scripts\flags.ps1')
 
 # Archive a scratch lineage: best/history -> <file>.<ts>.bak, drift dir ->
 # drift.<ts>.bak (stale drift snapshots would poison the next lineage's
@@ -119,7 +101,8 @@ if ($StagnationHours -le 0 -and $interactive) {
 if ($StagnationHours -gt 0 -and $interactive -and -not $PSBoundParameters.ContainsKey('OnStagnation')) {
     Write-Host ""
     Write-Host "  [s] stop    : just stop the solver"
-    Write-Host "  [m] merge   : stop, then plateau-merge best + drift snapshots (scripts\merge.ps1, needs ortools)"
+    Write-Host "  [m] merge   : stop, then plateau-merge best + drift snapshots (scripts\merge.ps1;"
+    Write-Host "                optional extra - needs Python 3 + pip install ortools; hunts never need python)"
     if ($Mode -eq 'scratch') {
         Write-Host "  [a] archive-and-restart : archive best/history/drift, start a truly fresh run (loops)"
     } else {
@@ -131,10 +114,25 @@ if ($StagnationHours -gt 0 -and $interactive -and -not $PSBoundParameters.Contai
     else { $OnStagnation = 'stop' }
 }
 
-if (-not (Test-Path .\solver.exe)) {
-    Write-Host "solver.exe not found - building via scripts\build.ps1 ..."
-    & "$PSScriptRoot\scripts\build.ps1"
-    if (-not (Test-Path .\solver.exe)) { throw "build failed - no solver.exe" }
+# Resolve the solver exe. Preference order:
+#   1. .\solver.exe            (native -march=native build, this machine only, gitignored)
+#   2. build it with g++       (scripts\build.ps1, if a toolchain is present)
+#   3. .\bin\solver.exe        (committed portable -march=x86-64-v3 build: any AVX2 CPU
+#                               ~2015+; lets a fresh clone run with no gcc installed)
+$exe = Join-Path $PSScriptRoot 'solver.exe'
+if (-not (Test-Path $exe)) {
+    Write-Host "solver.exe not found - trying a native build via scripts\build.ps1 ..."
+    try { & "$PSScriptRoot\scripts\build.ps1" } catch { Write-Host "build unavailable: $_" }
+    if (-not (Test-Path $exe)) {
+        $portable = Join-Path $PSScriptRoot 'bin\solver.exe'
+        if (Test-Path $portable) {
+            Write-Host "using the committed portable build bin\solver.exe (x86-64-v3; needs an AVX2 CPU, ~2015+)."
+            Write-Host "for a machine-tuned exe later: install g++ and run scripts\build.ps1"
+            $exe = $portable
+        } else {
+            throw "no solver exe: install g++ and run scripts\build.ps1, or restore bin\solver.exe from the repo"
+        }
+    }
 }
 
 if ($Mode -eq 'scratch') {
@@ -167,7 +165,6 @@ if ($Threads -gt 0) { $solverArgs += @('--threads', "$Threads") }
 if ($Minutes -gt 0) { $solverArgs += @('--minutes', "$Minutes") }
 
 $bestFile = Join-Path $OutDir "best_c$Clues.txt"
-$exe = Join-Path $PSScriptRoot 'solver.exe'
 # PS 5.1 Start-Process joins -ArgumentList with spaces and no quoting; quote
 # any element containing whitespace so paths with spaces survive.
 $argLine = ($solverArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
@@ -176,7 +173,7 @@ while ($true) {
     $log = Join-Path $OutDir ("run_c{0}_{1}.log" -f $Clues, (Get-Date -Format yyyyMMdd_HHmmss))
     $errLog = "$log.err"
     Write-Host ""
-    Write-Host "solver.exe $argLine"
+    Write-Host "$exe $argLine"
     Write-Host "log: $log   best: $bestFile"
     if ($StagnationHours -gt 0) {
         Write-Host ("stagnation watchdog: {0} h without a new best -> {1}" -f $StagnationHours, $OnStagnation)

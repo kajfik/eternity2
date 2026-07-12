@@ -48,6 +48,13 @@ struct Config {
     int clues = 5;              // 1 or 5
     int threads = 0;            // 0 = auto
     double polish_frac = 0.5;   // fraction of effort spent polishing (mix mode)
+    // dynamic polish_frac: reallocate compute from hunter to polish once the
+    // hunter enters the useless regime (best - hybavg gap widens, or polish
+    // polish iters plateau). Keeps hunt floor to maintain fresh-lineage diversity
+    // (hybrid emissions). Reduces hunt share gradually as gap widens.
+    bool polish_dyn = false;            // --polish-dyn 0/1 (default 0 = off)
+    int polish_dyn_gap_threshold = 60;  // trigger decay when best_score - hybavg >= this
+    double polish_dyn_floor = 0.15;     // min hunt share to maintain diversity (15%)
     std::string mode = "mix";   // hunt | polish | mix
     std::string out_dir = "runs";
     u64 node_cap = 40'000'000;  // per hunter restart
@@ -82,6 +89,11 @@ struct Config {
     double rec_seconds = 15;        // decomp: seam-polish time in reconciliation (Track B)
     // --- plateau-merge drift snapshots (task #5 Part A) ---
     std::string drift_dir;          // empty = off (default); else dir for drift_t<id>.txt
+    int drift_cap = 64;             // max snapshot lines kept per drift_t<id>.txt
+                                    // (drop oldest). The 464 record author's method
+                                    // is mass same-score harvest + merge: raise to
+                                    // thousands when plateau_merge is the plan
+                                    // (push460.ps1 passes 4096).
     // --- double-break + parity moves (raphael-anjou research adoptions) ---
     // cost-2 candidate tier (both W and N mismatch). Record boards contain
     // double-break cells (JB470 at (2,10), R461 at (14,14)); without this
@@ -2380,6 +2392,9 @@ struct Polisher {
     // once-per-arrival latch for the "reached g_best_score" snapshot so a
     // polisher sitting at the best score doesn't spam the file every step.
     int drift_last_best_seen = -1;
+    int drift_file_lines = -1;     // cached line count of this thread's drift
+                                   // file (-1 = not read yet); lets appends
+                                   // skip the read-all-rewrite path below cap
 
     explicit Polisher(u64 seed) : rng(seed) {}
 
@@ -2559,14 +2574,32 @@ struct Polisher {
     // plateau-merge drift snapshot (task #5 Part A): append one line
     // "<score> <1024-char edges>" to <drift_dir>/drift_t<thread_id>.txt,
     // reusing Board::edges_string() (the same board->edges idiom as
-    // save_board/report_completion). Capped at 64 lines/file (drop oldest);
-    // simplest correct implementation is an in-memory deque rewritten to disk
-    // on every append -- these fire rarely (once per stagnation cycle, or
-    // once per best-score arrival), so the O(64) rewrite cost is negligible.
-    // Thread-local file (one Polisher instance per OS thread): no locking.
+    // save_board/report_completion). Capped at cfg.drift_cap lines/file
+    // (drop oldest). Below the cap this is a pure O(1) append (line count
+    // cached across calls, seeded by one read of a pre-existing file); at
+    // the cap the file is read back and rewritten trimmed -- snapshots fire
+    // once per stagnation cycle or best arrival, so even the 4096-line
+    // rewrite (~4 MB) costs nothing at that rate. Thread-local file (one
+    // Polisher instance per OS thread): no locking.
     void drift_snapshot(int score) {
         if (cfg.drift_dir.empty()) return;
         std::string path = cfg.drift_dir + "/drift_t" + std::to_string(thread_id) + ".txt";
+        char buf[16];
+        snprintf(buf, sizeof buf, "%d ", score);
+        std::string nline = std::string(buf) + cur.edges_string();
+        if (drift_file_lines < 0) {   // first snapshot this run: count what's there
+            drift_file_lines = 0;
+            std::ifstream in(path);
+            std::string line;
+            while (std::getline(in, line))
+                if (!line.empty()) drift_file_lines++;
+        }
+        if (drift_file_lines < cfg.drift_cap) {
+            std::ofstream out(path, std::ios::app);
+            out << nline << "\n";
+            drift_file_lines++;
+            return;
+        }
         std::deque<std::string> lines;
         {
             std::ifstream in(path);
@@ -2574,12 +2607,11 @@ struct Polisher {
             while (std::getline(in, line))
                 if (!line.empty()) lines.push_back(line);
         }
-        char buf[16];
-        snprintf(buf, sizeof buf, "%d ", score);
-        lines.push_back(std::string(buf) + cur.edges_string());
-        while (lines.size() > 64) lines.pop_front();
+        lines.push_back(nline);
+        while ((int)lines.size() > cfg.drift_cap) lines.pop_front();
         std::ofstream out(path, std::ios::trunc);
         for (auto& l : lines) out << l << "\n";
+        drift_file_lines = (int)lines.size();
     }
 
     // umbrella distance-kick (task #4 Part A, from the 5-clue record
@@ -3506,13 +3538,40 @@ static void polisher_thread(u64 seed, int id) {
     while (!g_stop.load()) p.step();
 }
 
+// --polish-dyn: hunt share of a mix turn. Static default = 1 - polish_frac.
+// When enabled, the share decays linearly toward polish_dyn_floor as
+// (best_score - hybavg) grows past polish_dyn_gap_threshold: under the slip
+// stack hybavg pins at ~381.6 while best climbs, so the gap is a cheap proxy
+// for "hybrid emissions can no longer reach the frontier" (the 7.27-h run
+// where completions froze at the greedy bootstraps and all late progress came
+// from polish). The floor keeps fresh-lineage food flowing -- ensure_board
+// draws 30% from g_fresh, which only hybrids refill. Pure function of
+// existing atomics so mix threads and the status line agree.
+static double effective_hunt_share() {
+    double hs = 1.0 - cfg.polish_frac;
+    if (!cfg.polish_dyn) return hs;
+    u64 hc = g_hybrid.load(std::memory_order_relaxed);
+    if (hc < 1000) return hs;  // wait for a stable hybavg estimate
+    double hybavg = (double)g_hyb_score_sum.load(std::memory_order_relaxed)
+                    / (double)hc;
+    double gap = (double)g_best_score.load(std::memory_order_relaxed) - hybavg;
+    double t = (gap - cfg.polish_dyn_gap_threshold) / 10.0;  // full decay 10 pts past threshold
+    if (t <= 0) return hs;
+    if (t > 1) t = 1;
+    double fl = cfg.polish_dyn_floor;
+    if (fl > hs) fl = hs;  // the floor never raises the share
+    return hs + t * (fl - hs);
+}
+
 static void mix_thread(u64 seed, int id) {
     Hunter h(seed);
     Polisher p(seed ^ 0xabcdef123456ULL);
     p.thread_id = id;
     while (!g_stop.load()) {
         if (g_fresh.size() < 8) { h.greedy_complete(); continue; }
-        if (p.rng.uniform() < cfg.polish_frac) {
+        double pf = cfg.polish_dyn ? 1.0 - effective_hunt_share()
+                                   : cfg.polish_frac;
+        if (p.rng.uniform() < pf) {
             for (int i = 0; i < 400 && !g_stop.load(); i++) p.step();
         } else {
             // a hunt turn is a node budget, not one restart: under a slip
@@ -3592,6 +3651,7 @@ static void status_thread() {
             printf(" rings=%llu rerolls=%llu",
                    (unsigned long long)g_rings.load(),
                    (unsigned long long)g_ring_rerolls.load());
+        if (cfg.polish_dyn) printf(" hunt=%.2f", effective_hunt_share());
         printf("\n");
         last_nodes = n;
         fflush(stdout);
@@ -3620,6 +3680,9 @@ int main(int argc, char** argv) {
         else if (a == "--band-nodes") cfg.band_node_cap = std::stoull(next());
         else if (a == "--selftest") cfg.selftest = true;
         else if (a == "--polish-frac") cfg.polish_frac = std::stod(next());
+        else if (a == "--polish-dyn") cfg.polish_dyn = std::stoi(next()) != 0;
+        else if (a == "--polish-dyn-gap") cfg.polish_dyn_gap_threshold = std::stoi(next());
+        else if (a == "--polish-dyn-floor") cfg.polish_dyn_floor = std::stod(next());
         else if (a == "--seed-edges") cfg.seed_url = next();
         else if (a == "--order") cfg.order = next();
         else if (a == "--model-file") cfg.model_file = next();
@@ -3632,6 +3695,7 @@ int main(int argc, char** argv) {
         else if (a == "--explore-pct") cfg.explore_pct = std::stoi(next());
         else if (a == "--lahc") cfg.lahc_len = std::stoi(next());
         else if (a == "--drift-dir") cfg.drift_dir = next();
+        else if (a == "--drift-cap") cfg.drift_cap = std::max(1, std::stoi(next()));
         else if (a == "--cost2") cfg.cost2 = std::stoi(next());
         else if (a == "--parity-pct") cfg.parity_pct = std::stoi(next());
         else if (a == "--band-y0-min") cfg.band_y0_min = std::max(1, std::min(14, std::stoi(next())));

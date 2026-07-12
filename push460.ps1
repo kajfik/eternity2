@@ -1,0 +1,418 @@
+# push460.ps1 -- the "reach 460 from scratch on our own" pipeline, in one
+# console. Runs three engines side by side and glues them into a feedback
+# loop, based on the 2026-07-12 strategy analysis (see CLAUDE.md):
+#
+#   1. SOLVER   solver.exe resuming <OutDir>\best_c<Clues>.txt with the proven
+#               from-scratch flags (scripts\flags.ps1 $ScratchArgs) and a big
+#               drift harvest (--drift-cap, default 4096 snapshots/thread
+#               instead of the old 64) -- mass same-score plateau harvest, the
+#               464 record author's method.
+#   2. MERGE    tools\plateau_merge.py --loop: continuously CP-SAT-merges
+#               pairs of drift snapshots (+ the best board itself); each
+#               improvement lands in runs\candidate_merge_<score>_<hash>.txt.
+#   3. SWEEP    tools\window_sweep.py, rotated over the best board and every
+#               near-best candidate: exact improve-only CP-SAT windows over
+#               fault cells ("does ANY strictly better arrangement of this
+#               window's pieces exist?"). Runs in resumable chunks; pass 1
+#               uses default shapes at --time-per <SweepTimePer>, pass 2
+#               retries UNKNOWN windows at >=600 s each.
+#
+#   GLUE (this script's poll loop, every 30 s):
+#   - ADOPT: any merge/sweep candidate scoring above the current best is fed
+#     back into the solver (restart with --seed-edges <candidate>; the solver
+#     verifies conformance itself and writes the new best file). The improved
+#     board then gets drifted, merged, and swept in turn.
+#   - STAGNATION: no new best for -StagnationHours -> restart the solver on
+#     the same best file (pools reset; the lineage continues).
+#   - VICTORY: best >= -Target (default 460) -> stop everything, print the
+#     bucas URL.
+#
+# Everything is safe to Ctrl+C: the solver writes best_c*.txt on every new
+# best, sweep/merge state files make their work resumable, and the finally
+# block stops all children. Re-running the script continues where it left off.
+#
+# Usage:
+#   .\push460.ps1                          # defaults: 5 clues, target 460
+#   .\push460.ps1 -SolverThreads 24        # more solver, less CP-SAT headroom
+#   .\push460.ps1 -Minutes 10              # timed smoke run
+#   .\push460.ps1 -Fresh                   # archive the lineage, start over
+#   .\push460.ps1 -NoSweep                 # solver + merge only (less python load)
+#
+# Needs python 3 + `pip install ortools` for MERGE/SWEEP (pass -NoMerge
+# -NoSweep to run the solver alone without python).
+#
+# Thread budget: 0 = auto-scale to the machine's logical core count with a
+# 62/19/19 % solver/merge/sweep split (reproduces the tuned 20/6/6 on the
+# 32-thread reference box; 10/3/3 on 16 threads). CP-SAT workers are bursty,
+# so mild oversubscription is fine; drop -SolverThreads if the box feels
+# sluggish.
+param(
+    [int]$Clues = 5,
+    [int]$Target = 460,
+    [int]$SolverThreads = 0,   # 0 = auto (~62% of logical cores)
+    [int]$MergeWorkers = 0,    # 0 = auto (~19%)
+    [int]$SweepWorkers = 0,    # 0 = auto (~19%)
+    [double]$StagnationHours = 2,
+    [int]$DriftCap = 4096,
+    [string]$OutDir = 'runs_scratch',
+    [double]$SweepChunkMinutes = 45,   # one sweep child invocation's budget
+    [double]$SweepTimePer = 300,       # CP-SAT cap per window, pass 1
+    [double]$Minutes = 0,              # overall wall-clock cap (0 = until Ctrl+C/target)
+    [switch]$Fresh,                    # archive best/history/drift/sweep, start a new basin
+    [switch]$NoMerge,
+    [switch]$NoSweep
+)
+$ErrorActionPreference = 'Stop'
+Set-Location $PSScriptRoot
+. (Join-Path $PSScriptRoot 'scripts\flags.ps1')   # $ScratchArgs (canonical)
+
+# --- thread auto-split (see header) -------------------------------------------
+$nCores = [Environment]::ProcessorCount
+if ($SolverThreads -le 0) { $SolverThreads = [Math]::Max(2, [int][Math]::Floor($nCores * 0.625)) }
+if ($MergeWorkers  -le 0) { $MergeWorkers  = [Math]::Max(2, [int][Math]::Floor($nCores * 0.1875)) }
+if ($SweepWorkers  -le 0) { $SweepWorkers  = [Math]::Max(2, [int][Math]::Floor($nCores * 0.1875)) }
+
+# --- paths -------------------------------------------------------------------
+New-Item -ItemType Directory -Force $OutDir | Out-Null
+$OutDir   = (Resolve-Path $OutDir).Path
+$DriftDir = Join-Path $OutDir 'drift'
+$SweepDir = Join-Path $OutDir 'sweep'      # sweep targets + their state files
+$LogDir   = Join-Path $OutDir 'push460'    # child stdout/stderr logs
+foreach ($d in @($DriftDir, $SweepDir, $LogDir)) { New-Item -ItemType Directory -Force $d | Out-Null }
+$BestFile = Join-Path $OutDir "best_c$Clues.txt"
+$RunsDir  = Join-Path $PSScriptRoot 'runs'
+New-Item -ItemType Directory -Force $RunsDir | Out-Null
+
+function Log([string]$msg) {
+    Write-Host ("[push460 {0}] {1}" -f (Get-Date -Format HH:mm:ss), $msg)
+}
+
+# --- fresh start: archive the whole lineage (same idea as run.ps1, plus the
+# sweep dir -- stale targets/candidates from the old basin would otherwise be
+# adopted right back over the fresh one) ---------------------------------------
+if ($Fresh) {
+    $ts = Get-Date -Format yyyyMMdd_HHmmss
+    foreach ($f in @("best_c$Clues.txt", "history_c$Clues.log")) {
+        $p = Join-Path $OutDir $f
+        if (Test-Path $p) { Move-Item $p "$p.$ts.bak"; Log "archived $p" }
+    }
+    foreach ($d in @($DriftDir, $SweepDir)) {
+        if ((Test-Path $d) -and (Get-ChildItem $d -ErrorAction SilentlyContinue)) {
+            Move-Item $d "$d.$ts.bak"; New-Item -ItemType Directory -Force $d | Out-Null
+            Log "archived $d"
+        }
+    }
+}
+# candidates in runs\ older than this are ignored (only matters after -Fresh:
+# they belong to the archived basin and would out-score the new one instantly)
+if ($Fresh) { $CandidateCutoff = Get-Date } else { $CandidateCutoff = [datetime]::MinValue }
+
+# --- solver exe (same preference order as run.ps1) -----------------------------
+$exe = Join-Path $PSScriptRoot 'solver.exe'
+if (-not (Test-Path $exe)) {
+    Log "solver.exe not found - trying a native build via scripts\build.ps1 ..."
+    try { & "$PSScriptRoot\scripts\build.ps1" } catch { Log "build unavailable: $_" }
+    if (-not (Test-Path $exe)) {
+        $exe = Join-Path $PSScriptRoot 'bin\solver.exe'
+        if (-not (Test-Path $exe)) { throw "no solver exe: run scripts\build.ps1 or restore bin\solver.exe" }
+        Log "using portable bin\solver.exe"
+    }
+}
+
+# --- python + ortools (needed by MERGE and SWEEP) ------------------------------
+$UseMerge = -not $NoMerge
+$UseSweep = -not $NoSweep
+if ($UseMerge -or $UseSweep) {
+    if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+        throw "python not found on PATH (needed for merge/sweep). Install Python 3 + 'pip install ortools', or pass -NoMerge -NoSweep."
+    }
+    & python -c "import ortools" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "python found but ortools missing: pip install ortools (or pass -NoMerge -NoSweep)" }
+}
+
+# --- helpers -------------------------------------------------------------------
+function Quote-Args([string[]]$a) {
+    ($a | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+}
+
+function Get-BestScore {
+    # try/catch: the solver may be mid-rewrite of the best file; a transient
+    # sharing violation just means "ask again next poll"
+    if (-not (Test-Path $BestFile)) { return -1 }
+    try { $first = Get-Content $BestFile -TotalCount 1 -ErrorAction Stop } catch { return -1 }
+    if ($first -match 'score=(\d+)/480') { return [int]$Matches[1] }
+    return -1
+}
+
+function Stop-Child($proc, [string]$name) {
+    if ($proc -and -not $proc.HasExited) {
+        try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch {}
+        Log "stopped $name (pid $($proc.Id))"
+    }
+}
+
+# --- child: SOLVER --------------------------------------------------------------
+$script:SolverProc = $null
+$script:SolverLog = $null
+$script:SolverStarted = Get-Date
+function Start-Solver([string]$seedFile) {
+    $a = @('--clues', "$Clues", '--out', $OutDir,
+           '--drift-dir', $DriftDir, '--drift-cap', "$DriftCap") + $ScratchArgs
+    if ($SolverThreads -gt 0) { $a += @('--threads', "$SolverThreads") }
+    if ($seedFile) { $a += @('--seed-edges', $seedFile) }
+    $script:SolverLog = Join-Path $LogDir ("solver_{0}.log" -f (Get-Date -Format yyyyMMdd_HHmmss))
+    $line = Quote-Args $a
+    Log "solver: $exe $line"
+    Log "solver log: $($script:SolverLog)"
+    $script:SolverProc = Start-Process -FilePath $exe -ArgumentList $line `
+        -WorkingDirectory $PSScriptRoot -NoNewWindow -PassThru `
+        -RedirectStandardOutput $script:SolverLog -RedirectStandardError "$($script:SolverLog).err"
+    $script:SolverStarted = Get-Date
+}
+
+# --- child: MERGE loop -----------------------------------------------------------
+$script:MergeProc = $null
+function Start-Merge {
+    $a = @((Join-Path $PSScriptRoot 'tools\plateau_merge.py'),
+           '--dir', $DriftDir, '--clues', "$Clues", '--include', $BestFile,
+           '--loop', '--time', '900', '--time-per-pair', '60',
+           '--workers', "$MergeWorkers", '--max-window', '40', '--max-boards', '500')
+    $log = Join-Path $LogDir ("merge_{0}.log" -f (Get-Date -Format yyyyMMdd_HHmmss))
+    Log "merge loop: python $(Quote-Args $a)"
+    $script:MergeProc = Start-Process -FilePath python -ArgumentList (Quote-Args $a) `
+        -WorkingDirectory $PSScriptRoot -NoNewWindow -PassThru `
+        -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+}
+
+# --- SWEEP management -------------------------------------------------------------
+# Targets are immutable copies in $SweepDir named target_<score>_<hash8>.txt.
+# Per-target markers: .pass1.done / .pass2.done (retired when both exist),
+# window state lives in window_sweep's own .sweep_c*.state next to the copy.
+$script:SweepProc = $null
+$script:SweepTargetFile = $null
+$script:SweepPass = 0
+$script:SweepLog = $null
+
+function Sync-SweepTargets {
+    # candidate_merge boards (from the MERGE loop, or older sessions)
+    Get-ChildItem $RunsDir -Filter 'candidate_merge_*.txt' -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -gt $CandidateCutoff } | ForEach-Object {
+        if ($_.Name -match '^candidate_merge_(\d+)_([0-9a-f]+)\.txt$') {
+            $t = Join-Path $SweepDir ("target_{0}_{1}.txt" -f $Matches[1], $Matches[2])
+            if (-not (Test-Path $t)) { Copy-Item $_.FullName $t; Log "new sweep target: $(Split-Path $t -Leaf)" }
+        }
+    }
+    # the current best board itself (try/catch: solver may be mid-rewrite;
+    # skipped copies are retried on the next poll)
+    $score = Get-BestScore
+    if ($score -ge 0) {
+        try {
+            $h = (Get-FileHash $BestFile -Algorithm MD5 -ErrorAction Stop).Hash.Substring(0, 8).ToLower()
+            $t = Join-Path $SweepDir ("target_{0}_{1}.txt" -f $score, $h)
+            if (-not (Test-Path $t)) {
+                Copy-Item $BestFile $t -ErrorAction Stop
+                Log "new sweep target: $(Split-Path $t -Leaf)"
+            }
+        } catch {}
+    }
+}
+
+function Pick-SweepTarget([int]$curBest) {
+    $list = @()
+    Get-ChildItem $SweepDir -Filter 'target_*.txt' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^target_(\d+)_[0-9a-f]+\.txt$' } | ForEach-Object {
+        $null = $_.Name -match '^target_(\d+)_'
+        $score = [int]$Matches[1]
+        if ($score -lt $curBest - 1) { return }   # stale plateau, skip
+        $p1 = Test-Path "$($_.FullName).pass1.done"
+        $p2 = Test-Path "$($_.FullName).pass2.done"
+        if ($p1 -and $p2) { return }              # retired
+        if ($p1) { $pass = 2 } else { $pass = 1 }
+        $list += [pscustomobject]@{ File = $_.FullName; Score = $score; Pass = $pass; MTime = $_.LastWriteTime }
+    }
+    if ($list.Count -eq 0) { return $null }
+    $list | Sort-Object Pass, @{Expression = 'Score'; Descending = $true}, MTime | Select-Object -First 1
+}
+
+function Start-Sweep($tgt) {
+    $tp = $SweepTimePer
+    $extra = @()
+    if ($tgt.Pass -eq 2) {
+        $tp = [math]::Max($SweepTimePer, 600)
+        $extra = @('--retry-unknown')
+    }
+    $a = @((Join-Path $PSScriptRoot 'tools\window_sweep.py'),
+           '--board', $tgt.File, '--clues', "$Clues",
+           '--time-per', "$tp", '--minutes', "$SweepChunkMinutes",
+           '--workers', "$SweepWorkers", '--out', "$($tgt.File).improved.txt") + $extra
+    $script:SweepLog = Join-Path $LogDir ("sweep_{0}.log" -f (Get-Date -Format yyyyMMdd_HHmmss))
+    $script:SweepTargetFile = $tgt.File
+    $script:SweepPass = $tgt.Pass
+    Log ("sweep: {0} pass {1} ({2}-min chunk, {3} s/window)" -f (Split-Path $tgt.File -Leaf), $tgt.Pass, $SweepChunkMinutes, $tp)
+    $script:SweepProc = Start-Process -FilePath python -ArgumentList (Quote-Args $a) `
+        -WorkingDirectory $PSScriptRoot -NoNewWindow -PassThru `
+        -RedirectStandardOutput $script:SweepLog -RedirectStandardError "$($script:SweepLog).err"
+}
+
+function Finish-Sweep {
+    # called after the sweep child exits: classify the outcome
+    $t = $script:SweepTargetFile
+    $script:SweepProc = $null
+    if (-not $t) { return }
+    if (Test-Path "$t.improved.txt") {
+        # retire the target; the improvement is adopted by the poll loop and
+        # the improved board becomes its own (better) target
+        New-Item -ItemType File -Force "$t.pass1.done" | Out-Null
+        New-Item -ItemType File -Force "$t.pass2.done" | Out-Null
+        Log "sweep IMPROVEMENT on $(Split-Path $t -Leaf) - see $t.improved.txt"
+        return
+    }
+    $tail = @()
+    if ($script:SweepLog -and (Test-Path $script:SweepLog)) { $tail = Get-Content $script:SweepLog -Tail 3 }
+    # NB: a budget-exhausted chunk prints BOTH "time budget exhausted" AND the
+    # final "done:" summary -- check the budget marker first, else a pass would
+    # be retired after its first chunk
+    if ($tail -match 'time budget exhausted') {
+        # chunk over, state saved; the target stays queued and resumes later
+    } elseif ($tail -match '\[sweep\] done:') {
+        New-Item -ItemType File -Force ("$t.pass{0}.done" -f $script:SweepPass) | Out-Null
+        Log ("sweep pass {0} finished on {1}: no improvement (windows proven/undecided; see log)" -f $script:SweepPass, (Split-Path $t -Leaf))
+    } else {
+        Log "sweep child ended unexpectedly; last lines of $($script:SweepLog):"
+        $tail | ForEach-Object { Write-Host "    $_" }
+    }
+}
+
+# --- ADOPTION: merge/sweep candidates better than the current best ---------------
+$script:AdoptTried = @{}
+function Get-BestCandidate([int]$curBest) {
+    $cands = @()
+    Get-ChildItem $RunsDir -Filter 'candidate_merge_*.txt' -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -gt $CandidateCutoff } | ForEach-Object {
+        if ($_.Name -match '^candidate_merge_(\d+)_') {
+            $cands += [pscustomobject]@{ File = $_.FullName; Score = [int]$Matches[1]; MTime = $_.LastWriteTime }
+        }
+    }
+    Get-ChildItem $SweepDir -Filter '*.improved.txt' -ErrorAction SilentlyContinue | ForEach-Object {
+        try { $head = Get-Content $_.FullName -TotalCount 1 -ErrorAction Stop } catch { $head = '' }
+        if ($head -match '->\s*(\d+)') {
+            $cands += [pscustomobject]@{ File = $_.FullName; Score = [int]$Matches[1]; MTime = $_.LastWriteTime }
+        }
+    }
+    $cands = $cands | Where-Object {
+        $_.Score -gt $curBest -and (-not $script:AdoptTried.ContainsKey($_.File) -or $script:AdoptTried[$_.File] -lt 2)
+    }
+    if (-not $cands) { return $null }
+    $cands | Sort-Object @{Expression = 'Score'; Descending = $true}, @{Expression = 'MTime'; Descending = $true} | Select-Object -First 1
+}
+
+# --- main ------------------------------------------------------------------------
+$startScore = Get-BestScore
+if ($startScore -ge 0) { Log "resuming lineage: best $startScore/480 ($BestFile)" }
+else { Log "no best file yet - the solver starts a fresh from-scratch lineage" }
+Log "target: $Target/480 | drift cap $DriftCap/thread | stagnation restart after $StagnationHours h"
+Log "threads ($nCores logical cores): solver $SolverThreads | merge $MergeWorkers | sweep $SweepWorkers"
+
+$deadline = $null
+if ($Minutes -gt 0) { $deadline = (Get-Date).AddMinutes($Minutes) }
+
+try {
+    Start-Solver $null
+    if ($UseMerge) { Start-Merge }
+    $lastStatus = Get-Date
+    $lastBest = $startScore
+
+    while ($true) {
+        Start-Sleep -Seconds 30
+        $cur = Get-BestScore
+
+        # -- victory --
+        if ($cur -ge $Target) {
+            Log ("TARGET REACHED: {0}/480 >= {1}" -f $cur, $Target)
+            $url = (Select-String -Path $BestFile -Pattern 'bucas' | Select-Object -First 1)
+            if ($url) { Write-Host $url.Line }
+            break
+        }
+        # -- overall time cap --
+        if ($deadline -and (Get-Date) -gt $deadline) {
+            Log "time cap ($Minutes min) reached - stopping (best $cur/480)"
+            break
+        }
+        # -- solver died on its own? (crash or --minutes inside args) --
+        if ($script:SolverProc.HasExited) {
+            $err = "$($script:SolverLog).err"
+            if ((Test-Path $err) -and (Get-Item $err).Length -gt 0) {
+                Log "solver exited; stderr:"
+                Get-Content $err -Tail 5 | ForEach-Object { Write-Host "    $_" }
+            }
+            Log "restarting solver"
+            Start-Solver $null
+        }
+        # -- merge loop died? --
+        if ($UseMerge -and $script:MergeProc -and $script:MergeProc.HasExited) {
+            Log "merge loop exited - restarting it"
+            Start-Merge
+        }
+        # -- adoption: feed better candidates back into the solver --
+        $cand = Get-BestCandidate $cur
+        if ($cand) {
+            if ($script:AdoptTried.ContainsKey($cand.File)) { $script:AdoptTried[$cand.File]++ }
+            else { $script:AdoptTried[$cand.File] = 1 }
+            Log ("ADOPTING {0} ({1} > {2}) - restarting solver seeded from it" -f (Split-Path $cand.File -Leaf), $cand.Score, $cur)
+            Stop-Child $script:SolverProc 'solver'
+            Start-Solver $cand.File
+        }
+        # -- stagnation: restart the solver on the same best (pools reset) --
+        elseif ($StagnationHours -gt 0) {
+            $last = $script:SolverStarted
+            if (Test-Path $BestFile) {
+                $mt = (Get-Item $BestFile).LastWriteTime
+                if ($mt -gt $last) { $last = $mt }
+            }
+            if (((Get-Date) - $last).TotalHours -ge $StagnationHours) {
+                Log ("no new best for {0} h - restarting solver (pools reset, same lineage)" -f $StagnationHours)
+                Stop-Child $script:SolverProc 'solver'
+                Start-Solver $null
+            }
+        }
+        # -- sweep rotation --
+        if ($UseSweep) {
+            if ($script:SweepProc -and $script:SweepProc.HasExited) { Finish-Sweep }
+            if (-not $script:SweepProc -and $cur -ge 0) {
+                Sync-SweepTargets
+                # NB: not named $target -- that would collide (case-insensitively)
+                # with the [int]$Target script parameter and force an int cast
+                $pick = Pick-SweepTarget $cur
+                if ($pick) { Start-Sweep $pick }
+            }
+        }
+        # -- status line (once a minute) --
+        if (((Get-Date) - $lastStatus).TotalSeconds -ge 60) {
+            $lastStatus = Get-Date
+            if ($cur -ne $lastBest) {
+                Log ("NEW BEST {0}/480 (was {1})" -f $cur, $lastBest)
+                $lastBest = $cur
+            }
+            $sw = 'idle'
+            if ($script:SweepProc -and -not $script:SweepProc.HasExited) {
+                $sw = "{0} p{1}" -f (Split-Path $script:SweepTargetFile -Leaf), $script:SweepPass
+            } elseif (-not $UseSweep) { $sw = 'off' }
+            $mg = 'off'
+            if ($UseMerge) { if ($script:MergeProc.HasExited) { $mg = 'DEAD' } else { $mg = 'ok' } }
+            $solverLine = ''
+            if ($script:SolverLog -and (Test-Path $script:SolverLog)) {
+                try {
+                    $sl = Get-Content $script:SolverLog -Tail 1 -ErrorAction Stop
+                    if ($sl) { $solverLine = ' | ' + ($sl -replace '\s+', ' ').Trim() }
+                } catch {}
+            }
+            Log ("best={0}/480 target={1} | merge={2} | sweep={3}{4}" -f $cur, $Target, $mg, $sw, $solverLine)
+        }
+    }
+} finally {
+    Log "shutting down children..."
+    Stop-Child $script:SolverProc 'solver'
+    Stop-Child $script:MergeProc 'merge'
+    Stop-Child $script:SweepProc 'sweep'
+    Log ("final best: {0}/480 (board safe in {1})" -f (Get-BestScore), $BestFile)
+}

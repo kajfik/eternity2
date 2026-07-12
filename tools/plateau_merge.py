@@ -49,6 +49,7 @@ import glob
 import hashlib
 import json
 import os
+import random
 import time
 from collections import defaultdict
 
@@ -135,42 +136,63 @@ def append_state(state_path, rec):
         f.write(json.dumps(rec) + "\n")
 
 
-def build_pairs(snapshots, max_window):
+def build_pairs(snapshots, max_window, done, max_boards=0, keep_srcs=()):
     """Group by score, keep top-2 score groups, enumerate candidate pairs
-    (across threads too), ordered by disagreement size ascending."""
+    (across threads too), ordered by disagreement size ascending.
+
+    Scaled for large drift pools (--drift-cap in the thousands): dedupe is
+    O(n) via a set, already-solved pairs (fingerprint in `done`) are skipped
+    BEFORE the O(256) disagreement diff (per-board md5 cached once), and a
+    group larger than max_boards is randomly subsampled (boards whose src is
+    in keep_srcs -- the --include boards -- always survive sampling)."""
     by_score = defaultdict(list)
     for score, edges, src in snapshots:
         by_score[score].append((edges, src))
     top_scores = sorted(by_score, reverse=True)[:2]
 
     pairs = []
+    n_done = 0
     for score in top_scores:
-        entries = by_score[score]
-        # dedupe identical boards within a group (same edges from repeated
-        # snapshots) so we don't waste solves on a zero-size window
-        seen_edges = []
-        for edges, src in entries:
-            if edges not in [e for e, _ in seen_edges]:
-                seen_edges.append((edges, src))
-        n = len(seen_edges)
+        seen = set()
+        uniq = []
+        for edges, src in by_score[score]:
+            if edges not in seen:
+                seen.add(edges)
+                uniq.append((edges, src))
+        if max_boards and len(uniq) > max_boards:
+            kept = [e for e in uniq if e[1] in keep_srcs]
+            rest = [e for e in uniq if e[1] not in keep_srcs]
+            uniq = kept + random.sample(rest, max_boards - len(kept))
+            print(f"[plateau_merge] score {score}: sampled {len(uniq)} of "
+                  f"{len(seen)} distinct boards (--max-boards {max_boards})")
+        md5 = {edges: hashlib.md5(edges.encode()).hexdigest()
+               for edges, _ in uniq}
+        n = len(uniq)
         for i in range(n):
             for j in range(i + 1, n):
-                ea, sa = seen_edges[i]
-                eb, sb = seen_edges[j]
+                ea, sa = uniq[i]
+                eb, sb = uniq[j]
+                lo, hi = sorted((md5[ea], md5[eb]))
+                fp = hashlib.md5((lo + hi).encode()).hexdigest()
+                if fp in done:
+                    n_done += 1
+                    continue
                 diff = disagreement_cells(ea, eb)
                 if len(diff) < 4 or len(diff) > max_window:
                     continue
                 pairs.append((len(diff), score, ea, sa, eb, sb, diff))
     pairs.sort(key=lambda t: t[0])
-    return pairs
+    return pairs, n_done
 
 
 def run_once(args, clue_map):
     snapshots = load_snapshots(args.dir)
+    keep_srcs = set()
     for path in args.include:
         score, edges, src = load_include(path)
         print(f"[plateau_merge] --include {path}: score {score}")
         snapshots.append((score, edges, src))
+        keep_srcs.add(src)
     if not snapshots:
         print(f"[plateau_merge] no snapshot lines found in {args.dir}")
         return 0
@@ -178,15 +200,17 @@ def run_once(args, clue_map):
     print(f"[plateau_merge] {len(snapshots)} snapshot lines, scores present: "
           f"{scores[:5]}{'...' if len(scores) > 5 else ''}")
 
-    pairs = build_pairs(snapshots, args.max_window)
-    print(f"[plateau_merge] {len(pairs)} candidate pairs after top-2-score "
-          f"grouping and disagreement-size filter (4..{args.max_window})")
-
     state_path = os.path.join(args.dir, ".plateau_merge.state")
     done = load_state(state_path)
 
+    pairs, n_skipped = build_pairs(snapshots, args.max_window, done,
+                                   args.max_boards, keep_srcs)
+    print(f"[plateau_merge] {len(pairs)} candidate pairs after top-2-score "
+          f"grouping, dedupe against state ({n_skipped} already solved) and "
+          f"disagreement-size filter (4..{args.max_window})")
+
     t_end = time.time() + args.time if args.time else None
-    n_solved = n_skipped = n_improved = 0
+    n_solved = n_improved = 0
     for ndiff, score, ea, sa, eb, sb, diff in pairs:
         fp = pair_fingerprint(ea, eb)
         if fp in done:
@@ -250,6 +274,12 @@ def main():
     ap.add_argument("--max-window", type=int, default=45,
                     help="skip pairs whose disagreement set exceeds this "
                          "many cells (undecidable in practice)")
+    ap.add_argument("--max-boards", type=int, default=0,
+                    help="cap per score group: subsample this many distinct "
+                         "boards before pairing (0 = unlimited). Keeps pass "
+                         "startup O(max_boards^2) when --drift-cap harvests "
+                         "thousands of snapshots; --include boards always "
+                         "survive the sampling")
     ap.add_argument("--include", action="append", default=[],
                     help="also add this board file (solver best_c*.txt "
                          "format, or any file with a bare edges line or "

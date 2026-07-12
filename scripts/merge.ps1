@@ -30,6 +30,9 @@ param(
     [double]$TimePerPair = 60,
     [int]$Workers = 16,
     [int]$MaxWindow = 40,
+    [int]$MaxBoards = 500,        # per-score-group board cap (subsampled) so a
+                                  # --drift-cap-4096 harvest doesn't make pass
+                                  # startup O(n^2) over thousands of boards
     [switch]$Loop
 )
 $ErrorActionPreference = 'Stop'
@@ -51,7 +54,7 @@ if ($snapFiles.Count -eq 0) {
 }
 
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-    throw "python not found on PATH (needs Python 3 + pip install ortools)"
+    throw "python not found on PATH. The offline plateau merge is an OPTIONAL extra (hunts via run.ps1 never need python; the solver has an in-process merge move built in). To use it: install Python 3 + pip install ortools."
 }
 & python -c "import ortools" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "python found but ortools missing: pip install ortools" }
@@ -60,7 +63,8 @@ if (-not (Test-Path $driftDir)) { New-Item -ItemType Directory -Force $driftDir 
 $pyArgs = @('tools\plateau_merge.py',
             '--dir', $driftDir, '--clues', "$Clues", '--include', $bestFile,
             '--time', "$TimeBudget", '--time-per-pair', "$TimePerPair",
-            '--workers', "$Workers", '--max-window', "$MaxWindow")
+            '--workers', "$Workers", '--max-window', "$MaxWindow",
+            '--max-boards', "$MaxBoards")
 if ($Loop) { $pyArgs += '--loop' }
 Write-Host "python $($pyArgs -join ' ')"
 & python @pyArgs
