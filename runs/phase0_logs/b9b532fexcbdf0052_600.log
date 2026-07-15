@@ -1,0 +1,3 @@
+[diff] boards disagree on 25 cells
+[window_solve] cells=25 pool=25 vars=1105 win_edges=25 inc_gain=46 -> INFEASIBLE best_gain=None in 0.2s
+score stays 455 (status INFEASIBLE) — window PROVEN optimal for its piece pool

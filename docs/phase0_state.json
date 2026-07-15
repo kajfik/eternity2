@@ -1,0 +1,591 @@
+{
+ "created": "2026-07-13 23:10:01",
+ "boards": {
+  "45bbcff6": {
+   "path": "runs\\candidate_merge_455_45bbcff6.txt",
+   "score": 455,
+   "verified": "2026-07-15 09:24:41"
+  },
+  "a775bd8f": {
+   "path": "runs\\candidate_merge_455_a775bd8f.txt",
+   "score": 455,
+   "verified": "2026-07-15 09:24:41"
+  },
+  "35985248": {
+   "path": "runs\\archive_455_basinB\\candidate_merge_455_35985248.txt",
+   "score": 455,
+   "verified": "2026-07-15 09:24:41"
+  },
+  "4279accd": {
+   "path": "runs\\archive_455_basinB\\candidate_merge_455_4279accd.txt",
+   "score": 455,
+   "verified": "2026-07-15 09:24:41"
+  },
+  "addb1f31": {
+   "path": "runs\\archive_455_basinB\\candidate_merge_455_addb1f31.txt",
+   "score": 455,
+   "verified": "2026-07-15 09:24:41"
+  },
+  "b3cd2796": {
+   "path": "runs\\archive_455_basinB\\candidate_merge_455_b3cd2796.txt",
+   "score": 455,
+   "verified": "2026-07-15 09:24:41"
+  },
+  "b9b532fe": {
+   "path": "runs\\archive_455_basinB\\candidate_merge_455_b9b532fe.txt",
+   "score": 455,
+   "verified": "2026-07-15 09:24:41"
+  },
+  "cbdf0052": {
+   "path": "runs\\archive_455_basinB\\candidate_merge_455_cbdf0052.txt",
+   "score": 455,
+   "verified": "2026-07-15 09:24:41"
+  }
+ },
+ "pairs": {
+  "35985248x4279accd": {
+   "a": "35985248",
+   "b": "4279accd",
+   "diff": 27,
+   "skip": null,
+   "results": {
+    "600": {
+     "status": "INFEASIBLE",
+     "wall": 1.4,
+     "solve_s": 0.6,
+     "win_edges": 30,
+     "inc_gain": 48,
+     "when": "2026-07-13 23:10:05"
+    }
+   }
+  },
+  "35985248x45bbcff6": {
+   "a": "35985248",
+   "b": "45bbcff6",
+   "diff": 247,
+   "skip": "cross-basin (diff>45), merge void",
+   "results": {}
+  },
+  "35985248xa775bd8f": {
+   "a": "35985248",
+   "b": "a775bd8f",
+   "diff": 247,
+   "skip": "cross-basin (diff>45), merge void",
+   "results": {}
+  },
+  "35985248xaddb1f31": {
+   "a": "35985248",
+   "b": "addb1f31",
+   "diff": 27,
+   "skip": null,
+   "results": {
+    "600": {
+     "status": "INFEASIBLE",
+     "wall": 1.4,
+     "solve_s": 0.5,
+     "win_edges": 30,
+     "inc_gain": 48,
+     "when": "2026-07-13 23:10:06"
+    }
+   }
+  },
+  "35985248xb3cd2796": {
+   "a": "35985248",
+   "b": "b3cd2796",
+   "diff": 28,
+   "skip": null,
+   "results": {
+    "600": {
+     "status": "UNKNOWN",
+     "wall": 601.6,
+     "solve_s": 600.7,
+     "win_edges": 31,
+     "inc_gain": 52,
+     "when": "2026-07-13 23:20:17"
+    },
+    "1800": {
+     "status": "INFEASIBLE",
+     "wall": 503.8,
+     "solve_s": 502.9,
+     "win_edges": 31,
+     "inc_gain": 52,
+     "when": "2026-07-14 00:18:51"
+    }
+   }
+  },
+  "35985248xb9b532fe": {
+   "a": "35985248",
+   "b": "b9b532fe",
+   "diff": 28,
+   "skip": null,
+   "results": {
+    "600": {
+     "status": "UNKNOWN",
+     "wall": 601.3,
+     "solve_s": 600.5,
+     "win_edges": 31,
+     "inc_gain": 52,
+     "when": "2026-07-13 23:30:19"
+    },
+    "1800": {
+     "status": "INFEASIBLE",
+     "wall": 1047.0,
+     "solve_s": 1046.1,
+     "win_edges": 31,
+     "inc_gain": 52,
+     "when": "2026-07-14 00:36:18"
+    }
+   }
+  },
+  "35985248xcbdf0052": {
+   "a": "35985248",
+   "b": "cbdf0052",
+   "diff": 4,
+   "skip": "diff<5 trivially INFEASIBLE",
+   "results": {}
+  },
+  "4279accdx45bbcff6": {
+   "a": "4279accd",
+   "b": "45bbcff6",
+   "diff": 248,
+   "skip": "cross-basin (diff>45), merge void",
+   "results": {}
+  },
+  "4279accdxa775bd8f": {
+   "a": "4279accd",
+   "b": "a775bd8f",
+   "diff": 248,
+   "skip": "cross-basin (diff>45), merge void",
+   "results": {}
+  },
+  "4279accdxaddb1f31": {
+   "a": "4279accd",
+   "b": "addb1f31",
+   "diff": 1,
+   "skip": "diff<5 trivially INFEASIBLE",
+   "results": {}
+  },
+  "4279accdxb3cd2796": {
+   "a": "4279accd",
+   "b": "b3cd2796",
+   "diff": 37,
+   "skip": null,
+   "results": {
+    "600": {
+     "status": "UNKNOWN",
+     "wall": 602.0,
+     "solve_s": 601.1,
+     "win_edges": 49,
+     "inc_gain": 62,
+     "when": "2026-07-13 23:40:21"
+    },
+    "1800": {
+     "status": "UNKNOWN",
+     "wall": 1804.5,
+     "solve_s": 1801.1,
+     "win_edges": 49,
+     "inc_gain": 62,
+     "when": "2026-07-14 12:35:34"
+    },
+    "14400": {
+     "status": "UNKNOWN",
+     "wall": 14404.2,
+     "solve_s": 14403.3,
+     "win_edges": 49,
+     "inc_gain": 62,
+     "when": "2026-07-14 19:56:16"
+    }
+   }
+  },
+  "4279accdxb9b532fe": {
+   "a": "4279accd",
+   "b": "b9b532fe",
+   "diff": 37,
+   "skip": null,
+   "results": {
+    "600": {
+     "status": "UNKNOWN",
+     "wall": 602.2,
+     "solve_s": 601.2,
+     "win_edges": 49,
+     "inc_gain": 62,
+     "when": "2026-07-13 23:50:23"
+    },
+    "1800": {
+     "status": "UNKNOWN",
+     "wall": 1801.8,
+     "solve_s": 1801.0,
+     "win_edges": 49,
+     "inc_gain": 62,
+     "when": "2026-07-14 14:27:02"
+    },
+    "14400": {
+     "status": "UNKNOWN",
+     "wall": 14404.2,
+     "solve_s": 14403.3,
+     "win_edges": 49,
+     "inc_gain": 62,
+     "when": "2026-07-14 19:56:16",
+     "via": "4279accdxb3cd2796"
+    }
+   }
+  },
+  "4279accdxcbdf0052": {
+   "a": "4279accd",
+   "b": "cbdf0052",
+   "diff": 27,
+   "skip": null,
+   "results": {
+    "600": {
+     "status": "INFEASIBLE",
+     "wall": 5.4,
+     "solve_s": 4.6,
+     "win_edges": 31,
+     "inc_gain": 46,
+     "when": "2026-07-13 23:10:12"
+    }
+   }
+  },
+  "45bbcff6xa775bd8f": {
+   "a": "45bbcff6",
+   "b": "a775bd8f",
+   "diff": 4,
+   "skip": "diff<5 trivially INFEASIBLE",
+   "results": {}
+  },
+  "45bbcff6xaddb1f31": {
+   "a": "45bbcff6",
+   "b": "addb1f31",
+   "diff": 248,
+   "skip": "cross-basin (diff>45), merge void",
+   "results": {}
+  },
+  "45bbcff6xb3cd2796": {
+   "a": "45bbcff6",
+   "b": "b3cd2796",
+   "diff": 248,
+   "skip": "cross-basin (diff>45), merge void",
+   "results": {}
+  },
+  "45bbcff6xb9b532fe": {
+   "a": "45bbcff6",
+   "b": "b9b532fe",
+   "diff": 248,
+   "skip": "cross-basin (diff>45), merge void",
+   "results": {}
+  },
+  "45bbcff6xcbdf0052": {
+   "a": "45bbcff6",
+   "b": "cbdf0052",
+   "diff": 247,
+   "skip": "cross-basin (diff>45), merge void",
+   "results": {}
+  },
+  "a775bd8fxaddb1f31": {
+   "a": "a775bd8f",
+   "b": "addb1f31",
+   "diff": 248,
+   "skip": "cross-basin (diff>45), merge void",
+   "results": {}
+  },
+  "a775bd8fxb3cd2796": {
+   "a": "a775bd8f",
+   "b": "b3cd2796",
+   "diff": 248,
+   "skip": "cross-basin (diff>45), merge void",
+   "results": {}
+  },
+  "a775bd8fxb9b532fe": {
+   "a": "a775bd8f",
+   "b": "b9b532fe",
+   "diff": 248,
+   "skip": "cross-basin (diff>45), merge void",
+   "results": {}
+  },
+  "a775bd8fxcbdf0052": {
+   "a": "a775bd8f",
+   "b": "cbdf0052",
+   "diff": 247,
+   "skip": "cross-basin (diff>45), merge void",
+   "results": {}
+  },
+  "addb1f31xb3cd2796": {
+   "a": "addb1f31",
+   "b": "b3cd2796",
+   "diff": 37,
+   "skip": null,
+   "results": {
+    "600": {
+     "status": "UNKNOWN",
+     "wall": 602.0,
+     "solve_s": 601.1,
+     "win_edges": 49,
+     "inc_gain": 62,
+     "when": "2026-07-14 00:00:25"
+    },
+    "1800": {
+     "status": "UNKNOWN",
+     "wall": 1801.7,
+     "solve_s": 1801.0,
+     "win_edges": 49,
+     "inc_gain": 62,
+     "when": "2026-07-14 14:57:04"
+    },
+    "14400": {
+     "status": "UNKNOWN",
+     "wall": 14404.2,
+     "solve_s": 14403.3,
+     "win_edges": 49,
+     "inc_gain": 62,
+     "when": "2026-07-14 19:56:16",
+     "via": "4279accdxb3cd2796"
+    }
+   }
+  },
+  "addb1f31xb9b532fe": {
+   "a": "addb1f31",
+   "b": "b9b532fe",
+   "diff": 37,
+   "skip": null,
+   "results": {
+    "600": {
+     "status": "UNKNOWN",
+     "wall": 601.6,
+     "solve_s": 600.6,
+     "win_edges": 49,
+     "inc_gain": 62,
+     "when": "2026-07-14 00:10:27"
+    },
+    "1800": {
+     "status": "UNKNOWN",
+     "wall": 1802.5,
+     "solve_s": 1801.8,
+     "win_edges": 49,
+     "inc_gain": 62,
+     "when": "2026-07-14 15:27:06"
+    },
+    "14400": {
+     "status": "UNKNOWN",
+     "wall": 14404.2,
+     "solve_s": 14403.3,
+     "win_edges": 49,
+     "inc_gain": 62,
+     "when": "2026-07-14 19:56:16",
+     "via": "4279accdxb3cd2796"
+    }
+   }
+  },
+  "addb1f31xcbdf0052": {
+   "a": "addb1f31",
+   "b": "cbdf0052",
+   "diff": 27,
+   "skip": null,
+   "results": {
+    "600": {
+     "status": "INFEASIBLE",
+     "wall": 4.1,
+     "solve_s": 3.3,
+     "win_edges": 31,
+     "inc_gain": 46,
+     "when": "2026-07-13 23:10:16"
+    }
+   }
+  },
+  "b3cd2796xb9b532fe": {
+   "a": "b3cd2796",
+   "b": "b9b532fe",
+   "diff": 1,
+   "skip": "diff<5 trivially INFEASIBLE",
+   "results": {}
+  },
+  "b3cd2796xcbdf0052": {
+   "a": "b3cd2796",
+   "b": "cbdf0052",
+   "diff": 25,
+   "skip": null,
+   "results": {
+    "600": {
+     "status": "INFEASIBLE",
+     "wall": 1.0,
+     "solve_s": 0.2,
+     "win_edges": 25,
+     "inc_gain": 46,
+     "when": "2026-07-13 23:10:02"
+    }
+   }
+  },
+  "b9b532fexcbdf0052": {
+   "a": "b9b532fe",
+   "b": "cbdf0052",
+   "diff": 25,
+   "skip": null,
+   "results": {
+    "600": {
+     "status": "INFEASIBLE",
+     "wall": 1.0,
+     "solve_s": 0.2,
+     "win_edges": 25,
+     "inc_gain": 46,
+     "when": "2026-07-13 23:10:03"
+    }
+   }
+  }
+ },
+ "clusters": {
+  "cluster_45bbcff6_0": {
+   "board": "45bbcff6",
+   "cells": [
+    27,
+    28,
+    29,
+    30,
+    31,
+    42,
+    43,
+    44,
+    45,
+    61,
+    62,
+    63,
+    76,
+    77,
+    78,
+    79,
+    92,
+    106,
+    107,
+    108,
+    110,
+    111,
+    125,
+    126,
+    142,
+    143
+   ],
+   "n_cells": 26,
+   "dilate": 1,
+   "time": 7200,
+   "results": {
+    "7200": {
+     "status": "UNKNOWN",
+     "wall": 7203.6,
+     "solve_s": 7202.3,
+     "win_edges": 97,
+     "inc_gain": 106,
+     "when": "2026-07-14 21:56:20"
+    }
+   }
+  },
+  "cluster_45bbcff6_1": {
+   "board": "45bbcff6",
+   "cells": [
+    155,
+    156,
+    172,
+    173,
+    189,
+    190,
+    191,
+    205,
+    206,
+    220,
+    221,
+    222,
+    236,
+    237,
+    238
+   ],
+   "n_cells": 15,
+   "dilate": 1,
+   "time": 7200,
+   "results": {
+    "7200": {
+     "status": "INFEASIBLE",
+     "wall": 2.5,
+     "solve_s": 1.4,
+     "win_edges": 62,
+     "inc_gain": 75,
+     "when": "2026-07-14 21:56:23"
+    }
+   }
+  },
+  "cluster_a775bd8f_0": {
+   "board": "a775bd8f",
+   "cells": [
+    27,
+    28,
+    29,
+    30,
+    31,
+    42,
+    43,
+    44,
+    45,
+    61,
+    62,
+    63,
+    76,
+    77,
+    78,
+    79,
+    92,
+    106,
+    107,
+    108,
+    110,
+    111,
+    125,
+    126,
+    142,
+    143
+   ],
+   "n_cells": 26,
+   "dilate": 1,
+   "time": 7200,
+   "results": {
+    "7200": {
+     "status": "UNKNOWN",
+     "wall": 7210.1,
+     "solve_s": 7206.1,
+     "win_edges": 97,
+     "inc_gain": 106,
+     "when": "2026-07-15 11:24:52"
+    }
+   }
+  },
+  "cluster_a775bd8f_1": {
+   "board": "a775bd8f",
+   "cells": [
+    155,
+    156,
+    172,
+    173,
+    189,
+    190,
+    191,
+    205,
+    206,
+    220,
+    221,
+    222,
+    236,
+    237,
+    238
+   ],
+   "n_cells": 15,
+   "dilate": 1,
+   "time": 7200,
+   "results": {
+    "7200": {
+     "status": "INFEASIBLE",
+     "wall": 2.5,
+     "solve_s": 1.3,
+     "win_edges": 62,
+     "inc_gain": 75,
+     "when": "2026-07-15 11:24:55"
+    }
+   }
+  }
+ },
+ "sat": null
+}

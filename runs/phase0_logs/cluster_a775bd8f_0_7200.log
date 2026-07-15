@@ -1,0 +1,2 @@
+[window_solve] cells=59 pool=59 vars=7941 win_edges=97 inc_gain=106 -> UNKNOWN best_gain=None in 7206.1s
+score stays 455 (status UNKNOWN)

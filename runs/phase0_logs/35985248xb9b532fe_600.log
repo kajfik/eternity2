@@ -1,0 +1,3 @@
+[diff] boards disagree on 28 cells
+[window_solve] cells=28 pool=28 vars=1525 win_edges=31 inc_gain=52 -> UNKNOWN best_gain=None in 600.5s
+score stays 455 (status UNKNOWN)

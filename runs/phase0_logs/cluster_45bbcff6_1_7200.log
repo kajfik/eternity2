@@ -1,0 +1,2 @@
+[window_solve] cells=39 pool=39 vars=3446 win_edges=62 inc_gain=75 -> INFEASIBLE best_gain=None in 1.4s
+score stays 455 (status INFEASIBLE) — window PROVEN optimal for its piece pool
