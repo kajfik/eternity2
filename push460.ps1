@@ -24,6 +24,13 @@
 #     board then gets drifted, merged, and swept in turn.
 #   - STAGNATION: no new best for -StagnationHours -> restart the solver on
 #     the same best file (pools reset; the lineage continues).
+#   - EXHAUSTION: no new best for -ExhaustedHours AND the sweep queue is fully
+#     drained (every near-best target has both passes done, no sweep running,
+#     no adoptable candidate -- any new merge candidate re-fills the queue, so
+#     a drained queue really means merge+sweep have nothing left on this
+#     basin). -OnExhausted picks what happens: 'notify' (default; beeps and
+#     prints a banner every hour, run keeps going) or 'restart' (archive the
+#     lineage like -Fresh and start a new basin automatically).
 #   - VICTORY: best >= -Target (default 460) -> stop everything, print the
 #     bucas URL.
 #
@@ -42,6 +49,9 @@
 #   .\push460.ps1 -Minutes 10              # timed smoke run
 #   .\push460.ps1 -Fresh                   # archive the lineage, start over
 #   .\push460.ps1 -NoSweep                 # solver + merge only (less python load)
+#   .\push460.ps1 -OnExhausted restart     # auto-archive + fresh basin when the
+#                                          # lineage is exhausted (see above)
+#   .\push460.ps1 -ExhaustedHours 10       # be more patient before declaring it
 #
 # Needs python 3 + `pip install ortools` for MERGE/SWEEP (pass -NoMerge
 # -NoSweep to run the solver alone without python).
@@ -61,6 +71,9 @@ param(
     [int]$MergeWorkers = 0,    # 0 = auto (~19%)
     [int]$SweepWorkers = 0,    # 0 = auto (~19%)
     [double]$StagnationHours = 2,
+    [double]$ExhaustedHours = 6,       # no new best this long + sweep drained = basin exhausted (0 = never)
+    [ValidateSet('notify','restart')]
+    [string]$OnExhausted = 'notify',   # notify: hourly beep+banner; restart: auto -Fresh
     [int]$DriftCap = 4096,
     [string]$OutDir = 'runs_scratch',
     [double]$SweepChunkMinutes = 45,   # one sweep child invocation's budget
@@ -110,6 +123,13 @@ if ($interactive) {
     # stagnation restart (solver only; merge/sweep keep their own state)
     do { $sel = Read-Host "Restart the solver after hours without a new best (0 = never) [$StagnationHours]" } until ($sel -eq '' -or $sel -match '^\d+(\.\d+)?$')
     if ($sel -ne '') { $StagnationHours = [double]$sel }
+    # basin exhaustion (no new best for hours AND the sweep queue drained)
+    do { $sel = Read-Host "Declare the basin exhausted after hours without a new best, once sweep has nothing left (0 = never) [$ExhaustedHours]" } until ($sel -eq '' -or $sel -match '^\d+(\.\d+)?$')
+    if ($sel -ne '') { $ExhaustedHours = [double]$sel }
+    if ($ExhaustedHours -gt 0) {
+        do { $sel = Read-Host "On exhaustion: [N]otify (beep + banner, keep running) or [R]estart a fresh basin automatically (n/r) [n]" } until ($sel -eq '' -or $sel -match '^[nrNR]$')
+        if ($sel -match '^[rR]$') { $OnExhausted = 'restart' }
+    }
 }
 
 # --- thread auto-split (see header) -------------------------------------------
@@ -136,8 +156,9 @@ function Log([string]$msg) {
 
 # --- fresh start: archive the whole lineage (same idea as run.ps1, plus the
 # sweep dir -- stale targets/candidates from the old basin would otherwise be
-# adopted right back over the fresh one) ---------------------------------------
-if ($Fresh) {
+# adopted right back over the fresh one). Also called by the exhaustion
+# auto-restart (-OnExhausted restart) mid-run. ----------------------------------
+function Archive-Lineage {
     $ts = Get-Date -Format yyyyMMdd_HHmmss
     foreach ($f in @("best_c$Clues.txt", "history_c$Clues.log")) {
         $p = Join-Path $OutDir $f
@@ -150,6 +171,7 @@ if ($Fresh) {
         }
     }
 }
+if ($Fresh) { Archive-Lineage }
 # candidates in runs\ older than this are ignored (only matters after -Fresh:
 # they belong to the archived basin and would out-score the new one instantly)
 if ($Fresh) { $CandidateCutoff = Get-Date } else { $CandidateCutoff = [datetime]::MinValue }
@@ -392,6 +414,7 @@ $startScore = Get-BestScore
 if ($startScore -ge 0) { Log "resuming lineage: best $startScore/480 ($BestFile)" }
 else { Log "no best file yet - the solver starts a fresh from-scratch lineage" }
 Log "target: $Target/480 | drift cap $DriftCap/thread | stagnation restart after $StagnationHours h"
+if ($ExhaustedHours -gt 0) { Log "exhaustion: after $ExhaustedHours h without a new best + drained sweep queue -> $OnExhausted" }
 Log "threads (budget $threadBudget, $nCores logical cores): solver $SolverThreads | merge $MergeWorkers | sweep $SweepWorkers"
 
 $deadline = $null
@@ -402,10 +425,16 @@ try {
     if ($UseMerge) { Start-Merge }
     $lastStatus = Get-Date
     $lastBest = $startScore
+    # exhaustion clock: last time the lineage's best actually improved (survives
+    # solver restarts, unlike $SolverStarted which the stagnation check uses)
+    $exhaustBest = $startScore
+    $lastBestChange = Get-Date
+    $lastExhaustNotify = [datetime]::MinValue
 
     while ($true) {
         Start-Sleep -Seconds 30
         $cur = Get-BestScore
+        if ($cur -gt $exhaustBest) { $exhaustBest = $cur; $lastBestChange = Get-Date }
 
         # -- victory --
         if ($cur -ge $Target) {
@@ -436,6 +465,19 @@ try {
         }
         # -- adoption: feed better candidates back into the solver --
         $cand = Get-BestCandidate $cur
+        # -- exhaustion test: lineage stagnant for -ExhaustedHours AND the sweep
+        # queue drained (no chunk running, no target left at >= best-1; any new
+        # merge candidate becomes a target and un-drains it, so this really
+        # means merge+sweep have nothing left on this basin) --
+        $exhausted = $false
+        if (-not $cand -and $ExhaustedHours -gt 0 -and
+            ((Get-Date) - $lastBestChange).TotalHours -ge $ExhaustedHours) {
+            $exhausted = $true
+            if ($UseSweep) {
+                if ($script:SweepProc -and -not $script:SweepProc.HasExited) { $exhausted = $false }
+                else { Sync-SweepTargets; if (Pick-SweepTarget $cur) { $exhausted = $false } }
+            }
+        }
         if ($cand) {
             if ($script:AdoptTried.ContainsKey($cand.File)) { $script:AdoptTried[$cand.File]++ }
             else { $script:AdoptTried[$cand.File] = 1 }
@@ -443,7 +485,24 @@ try {
             Stop-Child $script:SolverProc 'solver'
             Start-Solver $cand.File
         }
-        # -- stagnation: restart the solver on the same best (pools reset) --
+        elseif ($exhausted -and $OnExhausted -eq 'restart') {
+            Log ("BASIN EXHAUSTED at {0}/480: no new best for {1} h and the sweep queue is drained - archiving the lineage and starting a fresh basin" -f $cur, $ExhaustedHours)
+            # children first: they hold open handles inside drift/ (Move-Item on
+            # a dir with open handles fails on Windows)
+            Stop-Child $script:SolverProc 'solver'
+            Stop-Child $script:MergeProc 'merge'
+            $script:SweepProc = $null; $script:SweepTargetFile = $null
+            Archive-Lineage
+            $CandidateCutoff = Get-Date   # runs\candidate_merge_* from the old basin must not be re-adopted
+            $script:AdoptTried = @{}
+            $exhaustBest = -1; $lastBestChange = Get-Date; $lastBest = -1
+            Start-Solver $null
+            if ($UseMerge) { Start-Merge }
+            continue   # $cur is stale (pre-archive); re-read on the next poll
+        }
+        # -- stagnation: restart the solver on the same best (pools reset).
+        # Runs even while an exhaustion notify is pending, so the solver keeps
+        # getting pool resets until the user acts on the banner --
         elseif ($StagnationHours -gt 0) {
             $last = $script:SolverStarted
             if (Test-Path $BestFile) {
@@ -454,6 +513,21 @@ try {
                 Log ("no new best for {0} h - restarting solver (pools reset, same lineage)" -f $StagnationHours)
                 Stop-Child $script:SolverProc 'solver'
                 Start-Solver $null
+            }
+        }
+        # -- exhaustion notify (independent of the restart chain above) --
+        if ($exhausted -and $OnExhausted -eq 'notify') {
+            if (((Get-Date) - $lastExhaustNotify).TotalMinutes -ge 60) {
+                $lastExhaustNotify = Get-Date
+                Write-Host ""
+                Write-Host ("=" * 78) -ForegroundColor Yellow
+                Write-Host ("  BASIN EXHAUSTED at {0}/480: no new best for {1}+ h and the CP-SAT sweep" -f $cur, $ExhaustedHours) -ForegroundColor Yellow
+                Write-Host "  queue is drained - merge and sweep have nothing left to try here." -ForegroundColor Yellow
+                Write-Host "  Recommended: Ctrl+C, then restart with -Fresh (or answer [A]rchive) to" -ForegroundColor Yellow
+                Write-Host "  hunt a new basin. Or rerun with -OnExhausted restart to automate this." -ForegroundColor Yellow
+                Write-Host ("=" * 78) -ForegroundColor Yellow
+                Write-Host ""
+                try { 1..3 | ForEach-Object { [console]::Beep(880, 300); Start-Sleep -Milliseconds 150 } } catch {}
             }
         }
         # -- sweep rotation --
