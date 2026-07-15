@@ -52,7 +52,10 @@ $interactive = -not $PSBoundParameters.ContainsKey('Mode')
 # Archive a scratch lineage: best/history -> <file>.<ts>.bak, drift dir ->
 # drift.<ts>.bak (stale drift snapshots would poison the next lineage's
 # plateau merges -- plateau_merge.py groups by top score, and the old
-# lineage's high boards would shadow the new one's).
+# lineage's high boards would shadow the new one's). The whole-dir move also
+# carries plateau.txt (the solver's persisted g_plateau pool, 2026-07-15
+# harvest fix -- reloaded into g_plateau at startup, so it must never survive
+# into a fresh lineage) and .plateau_merge.state.
 function Archive-ScratchState([string]$dir, [int]$clues) {
     $ts = Get-Date -Format yyyyMMdd_HHmmss
     foreach ($f in @("best_c$clues.txt", "history_c$clues.log")) {

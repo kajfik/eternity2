@@ -94,6 +94,16 @@ struct Config {
                                     // is mass same-score harvest + merge: raise to
                                     // thousands when plateau_merge is the plan
                                     // (push460.ps1 passes 4096).
+    // plateau-harvest fix (2026-07-15, STRATEGY_460 P2): the old snapshot fired
+    // once per best-level ARRIVAL per thread, so the on-disk pool held ~2
+    // distinct boards while g_plateau held 215. drift_every snapshots the
+    // subsequent tie-DRIFT too: every K non-improving steps while within 1 of
+    // the global best (deduped by a per-thread ring of recent write hashes).
+    // It also gates plateau.txt persistence + reload (dump_plateau / the
+    // startup reload in main). 0 = the complete old behavior (arrival-only
+    // snapshots, no plateau.txt) -- the A/B baseline switch. Only active when
+    // --drift-dir is set, so solver defaults are bit-identical.
+    int drift_every = 300;
     // --- double-break + parity moves (raphael-anjou research adoptions) ---
     // cost-2 candidate tier (both W and N mismatch). Record boards contain
     // double-break cells (JB470 at (2,10), R461 at (14,14)); without this
@@ -585,6 +595,10 @@ struct SeedPool {
         std::lock_guard<std::mutex> lk(mu);
         return pool.size();
     }
+    std::vector<Board> copy_all() {
+        std::lock_guard<std::mutex> lk(mu);
+        return pool;
+    }
 };
 
 static std::atomic<int> g_best_score{-1};
@@ -648,6 +662,35 @@ static bool report_completion(const Board& b) {
         }
     }
     return false;
+}
+
+// persist the in-memory plateau archive (2026-07-15 plateau-harvest fix):
+// dump the deduped g_plateau pool to <drift-dir>/plateau.txt in the drift-file
+// format ("<score> <1024-char edges>" per line, scores recomputed) so
+// plateau_merge.py can pair the full in-RAM diversity and a restart can
+// reload it (see the startup reload in main). Written atomically (tmp +
+// rename) because the merge loop reads the directory live; if the rename
+// loses a race against a reader holding the file open, this dump is simply
+// skipped -- the next 5-min tick retries. Gated on drift_every like the
+// drift-not-arrival snapshots (0 = old behavior, no plateau.txt).
+static void dump_plateau() {
+    if (cfg.drift_dir.empty() || cfg.drift_every <= 0) return;
+    std::vector<Board> boards = g_plateau.copy_all();
+    if (boards.empty()) return;
+    std::string path = cfg.drift_dir + "/plateau.txt";
+    std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f) return;
+        for (const Board& b : boards)
+            f << b.score() << ' ' << b.edges_string() << '\n';
+    }
+    std::error_code ec;
+    fs::rename(tmp, path, ec);
+    if (ec) {  // fs::rename may refuse to replace on some Windows setups
+        fs::remove(path, ec);
+        fs::rename(tmp, path, ec);
+    }
 }
 
 // ------------------------------------------------------------------ ring solver
@@ -2395,6 +2438,14 @@ struct Polisher {
     int drift_file_lines = -1;     // cached line count of this thread's drift
                                    // file (-1 = not read yet); lets appends
                                    // skip the read-all-rewrite path below cap
+    // drift-not-arrival snapshots (2026-07-15 plateau-harvest fix): cadence
+    // counter + ring of the last DRIFT_RING board hashes this thread wrote,
+    // so a lineage parked on one arrangement doesn't rewrite it every K steps
+    // (cross-thread duplicates are fine -- plateau_merge dedupes on read).
+    static constexpr int DRIFT_RING = 256;
+    int drift_step_ctr = 0;
+    u64 drift_ring[DRIFT_RING] = {};
+    int drift_ring_n = 0, drift_ring_i = 0;
 
     explicit Polisher(u64 seed) : rng(seed) {}
 
@@ -2883,8 +2934,29 @@ struct Polisher {
     // unconditional reset silently disabled the umbrella) or resample.
     void bump_stagnation() {
         if (!local_only && cur_score >= 0 &&
-            cur_score + 1 >= g_best_score.load(std::memory_order_relaxed))
+            cur_score + 1 >= g_best_score.load(std::memory_order_relaxed)) {
             g_plateau.add(cur);
+            // drift-not-arrival snapshot (2026-07-15 plateau-harvest fix):
+            // the arrival snapshot in step() captures one board per
+            // best-level per thread; this captures the tie-drift AFTER
+            // arrival -- every drift_every non-improving near-best steps,
+            // skipping hashes this thread wrote recently. Same score-gated
+            // path as the g_plateau add above; never touches best files.
+            if (!cfg.drift_dir.empty() && cfg.drift_every > 0 &&
+                ++drift_step_ctr >= cfg.drift_every) {
+                drift_step_ctr = 0;
+                u64 h = board_hash(cur);
+                bool seen = false;
+                for (int i = 0; i < drift_ring_n && !seen; i++)
+                    seen = drift_ring[i] == h;
+                if (!seen) {
+                    drift_snapshot(cur_score);
+                    drift_ring[drift_ring_i] = h;
+                    drift_ring_i = (drift_ring_i + 1) % DRIFT_RING;
+                    if (drift_ring_n < DRIFT_RING) drift_ring_n++;
+                }
+            }
+        }
         if (++since_gain <= cfg.stagnation_kick) return;
         if (!local_only &&
             cur_score + 1 >= g_best_score.load(std::memory_order_relaxed))
@@ -3620,8 +3692,15 @@ static void dump_fitstats() {
 static void status_thread() {
     auto t0 = std::chrono::steady_clock::now();
     u64 last_nodes = 0;
+    u64 ticks = 0;
     while (!g_stop.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(15));
+        if (++ticks % 20 == 4) dump_plateau();  // first dump 1 min in (small
+                                                // loss window after restarts,
+                                                // visible in short smokes),
+                                                // then every 5 min. No-op
+                                                // unless --drift-dir is set
+                                                // and drift_every > 0.
         auto el = std::chrono::duration_cast<std::chrono::seconds>(
                       std::chrono::steady_clock::now() - t0).count();
         u64 n = g_nodes.load();
@@ -3696,6 +3775,7 @@ int main(int argc, char** argv) {
         else if (a == "--lahc") cfg.lahc_len = std::stoi(next());
         else if (a == "--drift-dir") cfg.drift_dir = next();
         else if (a == "--drift-cap") cfg.drift_cap = std::max(1, std::stoi(next()));
+        else if (a == "--drift-every") cfg.drift_every = std::max(0, std::stoi(next()));
         else if (a == "--cost2") cfg.cost2 = std::stoi(next());
         else if (a == "--parity-pct") cfg.parity_pct = std::stoi(next());
         else if (a == "--band-y0-min") cfg.band_y0_min = std::max(1, std::min(14, std::stoi(next())));
@@ -3851,6 +3931,51 @@ int main(int argc, char** argv) {
             printf("seed board loaded: %d/480\n", b.score());
             report_completion(b);
         } else printf("WARN: --seed-edges rejected (unparseable, wrong pieces, or clue mismatch)\n");
+    }
+
+    // plateau reload (2026-07-15 plateau-harvest fix): refill g_plateau from
+    // the persisted harvest (drift_t*.txt + plateau.txt in --drift-dir) so a
+    // solver restart no longer zeroes the merge pool. Every line is re-parsed
+    // into a board, must conform (clues + rim), and must RE-SCORE within 1 of
+    // the resumed best (the file's score field is only a cheap pre-filter,
+    // never trusted). Boards go into g_plateau only -- never g_seeds/g_fresh/
+    // g_best -- so no score-leakage path exists; merge_move re-checks scores
+    // against the live best again anyway. Gated on drift_every like the rest
+    // of the persistence feature (0 = old behavior, no reload).
+    if (!cfg.drift_dir.empty() && cfg.drift_every > 0) {
+        int resumed = g_best_score.load();
+        size_t n_lines = 0, n_loaded = 0;
+        std::unordered_set<std::string> seen_edges;
+        std::error_code dec;
+        for (const auto& de : fs::directory_iterator(cfg.drift_dir, dec)) {
+            if (dec) break;
+            if (!de.is_regular_file()) continue;
+            std::string name = de.path().filename().string();
+            bool is_drift = name.size() > 11 && name.rfind("drift_t", 0) == 0 &&
+                            name.compare(name.size() - 4, 4, ".txt") == 0;
+            if (!is_drift && name != "plateau.txt") continue;
+            std::ifstream f(de.path());
+            std::string line;
+            while (std::getline(f, line) &&
+                   n_loaded < (size_t)std::max(2, cfg.plateau_cap)) {
+                size_t sp = line.find(' ');
+                if (sp == std::string::npos || line.size() - sp - 1 != NC * 4)
+                    continue;
+                n_lines++;
+                int fsc = atoi(line.c_str());  // pre-filter only
+                if (resumed >= 0 && fsc < resumed - 1) continue;
+                std::string es = line.substr(sp + 1);
+                if (!seen_edges.insert(es).second) continue;
+                Board pb;
+                if (!load_board_edges(es, pb) || !board_conforms(pb)) continue;
+                if (resumed >= 0 && pb.score() < resumed - 1) continue;
+                if (g_plateau.add(pb)) n_loaded++;
+            }
+        }
+        if (n_lines)
+            printf("plateau reload: %zu boards into g_plateau (%zu lines in %s, "
+                   "gate score>=%d)\n", n_loaded, n_lines, cfg.drift_dir.c_str(),
+                   resumed - 1);
     }
 
     if (cfg.selftest) {
@@ -4036,6 +4161,7 @@ int main(int argc, char** argv) {
         });
     status_thread();  // runs until g_stop
     for (auto& t : ts) t.join();
+    dump_plateau();   // clean exit (--minutes watchdog): persist the final pool
     if (g_fs_on) dump_fitstats();
     u64 frs = g_restarts.load();
     u64 fhc = g_hybrid.load();

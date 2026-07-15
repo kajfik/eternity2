@@ -10,6 +10,10 @@
 #   --time-per-pair 60     improve-only CP-SAT windows either decide in
 #                          seconds or resist for 300 s+; 60 s catches the
 #                          deciders without burning time on the resisters
+#                          (lower score groups only)
+#   --time-top 600         the TOP score group's pairs get 10x: observed
+#                          22-cell top pairs decide in 20-32 s, 21+-cell
+#                          pairs go UNKNOWN at 60 s (2026-07-15 P5)
 #   --workers 16           the CP-SAT worker count every probe so far used
 #
 # Improvements are independently e2lib-verified and written to
@@ -28,6 +32,7 @@ param(
     [string]$OutDir = 'runs_scratch',
     [double]$TimeBudget = 1800,   # overall wall-clock cap (s); 0 = solve every pending pair
     [double]$TimePerPair = 60,
+    [double]$TimeTop = 600,       # per-pair cap for the top score group
     [int]$Workers = 16,
     [int]$MaxWindow = 40,
     [int]$MaxBoards = 500,        # per-score-group board cap (subsampled) so a
@@ -47,6 +52,7 @@ if (-not (Test-Path $bestFile)) { throw "$bestFile not found - nothing to merge"
 $snapFiles = @()
 if (Test-Path $driftDir) {
     $snapFiles = @(Get-ChildItem $driftDir -Filter 'drift_t*.txt' -ErrorAction SilentlyContinue)
+    $snapFiles += @(Get-ChildItem $driftDir -Filter 'plateau.txt' -ErrorAction SilentlyContinue)
 }
 if ($snapFiles.Count -eq 0) {
     Write-Host "warning: no drift snapshots in $driftDir - only the best board itself is in the pool, so no pairs can form."
@@ -74,6 +80,7 @@ if (-not (Test-Path $driftDir)) { New-Item -ItemType Directory -Force $driftDir 
 $pyArgs = @('tools\plateau_merge.py',
             '--dir', $driftDir, '--clues', "$Clues", '--include', $bestFile,
             '--time', "$TimeBudget", '--time-per-pair', "$TimePerPair",
+            '--time-top', "$TimeTop",
             '--workers', "$Workers", '--max-window', "$MaxWindow",
             '--max-boards', "$MaxBoards")
 if ($Loop) { $pyArgs += '--loop' }

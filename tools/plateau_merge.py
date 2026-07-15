@@ -6,7 +6,9 @@ src/solver.cpp, Part A of this feature). Two boards that share a lineage but
 drifted apart typically disagree only on a small "disagreement set" of cells
 (the two arrangements agree everywhere else). This driver:
 
-  1. Collects all snapshot lines from drift_t*.txt in --dir.
+  1. Collects all snapshot lines from drift_t*.txt in --dir, plus
+     plateau.txt (the solver's persisted in-memory g_plateau pool,
+     dumped every 5 min / at clean exit -- 2026-07-15 harvest fix).
   2. Groups them by score, keeps the top 2 score groups (the most promising
      near-best plateaus).
   3. For every pair within a group (including across different thread files),
@@ -60,9 +62,15 @@ NC = W * H
 
 
 def load_snapshots(drift_dir):
-    """Read every drift_t*.txt in drift_dir. Returns list of (score, edges, src)."""
+    """Read every drift_t*.txt (plus plateau.txt, the solver's persisted
+    g_plateau dump, 2026-07-15) in drift_dir. Returns list of
+    (score, edges, src)."""
+    paths = sorted(glob.glob(os.path.join(drift_dir, "drift_t*.txt")))
+    plateau = os.path.join(drift_dir, "plateau.txt")
+    if os.path.exists(plateau):
+        paths.append(plateau)
     out = []
-    for path in sorted(glob.glob(os.path.join(drift_dir, "drift_t*.txt"))):
+    for path in paths:
         src = os.path.basename(path)
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -197,6 +205,7 @@ def run_once(args, clue_map):
         print(f"[plateau_merge] no snapshot lines found in {args.dir}")
         return 0
     scores = sorted({s for s, _, _ in snapshots}, reverse=True)
+    top_score = scores[0]
     print(f"[plateau_merge] {len(snapshots)} snapshot lines, scores present: "
           f"{scores[:5]}{'...' if len(scores) > 5 else ''}")
 
@@ -219,10 +228,16 @@ def run_once(args, clue_map):
         if t_end and time.time() > t_end:
             print("[plateau_merge] time budget exhausted")
             break
+        # per-score-group time scaling (2026-07-15, STRATEGY_460 P5): the top
+        # score group is where +1 lives -- observed 22-cell 454-pairs decide
+        # in 20-32 s while 21+-cell pairs go UNKNOWN at 60 s, i.e. the default
+        # budget sits right at the decision edge. Lower groups keep the short
+        # budget so they can't starve the pass.
+        tp = args.time_top if score >= top_score else args.time_per_pair
         print(f"[plateau_merge] pair {sa}<->{sb} score={score} "
-              f"disagreement={ndiff} cells", flush=True)
+              f"disagreement={ndiff} cells budget={tp:g}s", flush=True)
         sname, new_edges, inc, best = solve_window(
-            ea, diff, clue_map, time_s=args.time_per_pair,
+            ea, diff, clue_map, time_s=tp,
             workers=args.workers, improve_only=True)
         n_solved += 1
         rec = {"fp": fp, "verdict": sname, "score": score, "ndiff": ndiff,
@@ -269,7 +284,13 @@ def main():
                     help="overall wall-clock budget per invocation (s); "
                          "0 = no cap (solve every pending pair)")
     ap.add_argument("--time-per-pair", type=float, default=60,
-                    help="CP-SAT time cap per pair (s)")
+                    help="CP-SAT time cap per pair (s) for score groups "
+                         "below the top one")
+    ap.add_argument("--time-top", type=float, default=600,
+                    help="CP-SAT time cap per pair (s) for the TOP score "
+                         "group -- where +1 lives; observed 22-cell top "
+                         "pairs decide in 20-32 s but 21+-cell pairs go "
+                         "UNKNOWN at 60 s, so the top group gets 10x")
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--max-window", type=int, default=45,
                     help="skip pairs whose disagreement set exceeds this "

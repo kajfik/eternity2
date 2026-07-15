@@ -22,8 +22,18 @@
 #     back into the solver (restart with --seed-edges <candidate>; the solver
 #     verifies conformance itself and writes the new best file). The improved
 #     board then gets drifted, merged, and swept in turn.
-#   - STAGNATION: no new best for -StagnationHours -> restart the solver on
-#     the same best file (pools reset; the lineage continues).
+#   - STAGNATION: no new best for -StagnationHours (default 3 h -- restarts no
+#     longer lose the plateau pool, see below, but re-climbs buy nothing so
+#     there is no hurry either) -> dump-then-merge (2026-07-15 P3): the solver
+#     dumps its in-memory plateau pool to <drift>\plateau.txt every 5 min, so
+#     first wait for a dump newer than the trigger (<=6 min), then give the
+#     merge loop one full pass over that fresh pool (a pass that STARTS after
+#     the dump; <=30 min timeout), and only then restart the solver on the
+#     same best file. The restarted solver reloads the whole persisted pool
+#     (drift_t*.txt + plateau.txt) back into g_plateau at startup. A new best
+#     or an adoption while waiting cancels the pending restart. -DriftEvery 0
+#     disables all of this (old behavior: immediate restart, arrival-only
+#     drift snapshots, no plateau.txt) -- the A/B baseline switch.
 #   - EXHAUSTION: no new best for -ExhaustedHours AND the sweep queue is fully
 #     drained (every near-best target has both passes done, no sweep running,
 #     no adoptable candidate -- any new merge candidate re-fills the queue, so
@@ -70,11 +80,15 @@ param(
     [int]$SolverThreads = 0,   # 0 = auto (~62% of the budget)
     [int]$MergeWorkers = 0,    # 0 = auto (~19%)
     [int]$SweepWorkers = 0,    # 0 = auto (~19%)
-    [double]$StagnationHours = 2,
+    [double]$StagnationHours = 3,
     [double]$ExhaustedHours = 6,       # no new best this long + sweep drained = basin exhausted (0 = never)
     [ValidateSet('notify','restart')]
     [string]$OnExhausted = 'notify',   # notify: hourly beep+banner; restart: auto -Fresh
     [int]$DriftCap = 4096,
+    [int]$DriftEvery = 300,            # solver --drift-every (near-best drift snapshot
+                                       # cadence + plateau.txt persistence/reload);
+                                       # 0 = the complete pre-2026-07-15 behavior
+                                       # (A/B baseline arm)
     [string]$OutDir = 'runs_scratch',
     [double]$SweepChunkMinutes = 45,   # one sweep child invocation's budget
     [double]$SweepTimePer = 300,       # CP-SAT cap per window, pass 1
@@ -260,7 +274,8 @@ $script:SolverLog = $null
 $script:SolverStarted = Get-Date
 function Start-Solver([string]$seedFile) {
     $a = @('--clues', "$Clues", '--out', $OutDir,
-           '--drift-dir', $DriftDir, '--drift-cap', "$DriftCap") + $ScratchArgs
+           '--drift-dir', $DriftDir, '--drift-cap', "$DriftCap",
+           '--drift-every', "$DriftEvery") + $ScratchArgs
     if ($SolverThreads -gt 0) { $a += @('--threads', "$SolverThreads") }
     if ($seedFile) { $a += @('--seed-edges', $seedFile) }
     $script:SolverLog = Join-Path $LogDir ("solver_{0}.log" -f (Get-Date -Format yyyyMMdd_HHmmss))
@@ -275,16 +290,36 @@ function Start-Solver([string]$seedFile) {
 
 # --- child: MERGE loop -----------------------------------------------------------
 $script:MergeProc = $null
+$script:MergeLog = $null
 function Start-Merge {
     $a = @((Join-Path $PSScriptRoot 'tools\plateau_merge.py'),
            '--dir', $DriftDir, '--clues', "$Clues", '--include', $BestFile,
-           '--loop', '--time', '900', '--time-per-pair', '60',
+           '--loop', '--time', '900', '--time-per-pair', '60', '--time-top', '600',
            '--workers', "$MergeWorkers", '--max-window', '40', '--max-boards', '500')
     $log = Join-Path $LogDir ("merge_{0}.log" -f (Get-Date -Format yyyyMMdd_HHmmss))
     Log "merge loop: $Python $(Quote-Args $a)"
     $script:MergeProc = Start-Process -FilePath $Python -ArgumentList (Quote-Args $a) `
         -WorkingDirectory $PSScriptRoot -NoNewWindow -PassThru `
         -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+    $script:MergeLog = $log
+}
+
+# dump-then-merge support (2026-07-15 P3): pass boundaries in the merge loop's
+# log. Every plateau_merge pass prints one 'snapshot lines' header at start
+# ('N snapshot lines, scores present' or 'no snapshot lines found') and one
+# '[plateau_merge] done:' summary at the end; passes run sequentially in one
+# process, so Dones > S0 (a Starts baseline) proves the (S0+1)-th pass -- the
+# first one that STARTED after the baseline was taken -- has completed.
+function Get-MergePassCounts {
+    $starts = 0; $dones = 0
+    if ($script:MergeLog -and (Test-Path $script:MergeLog)) {
+        try {
+            $txt = @(Get-Content $script:MergeLog -ErrorAction Stop)
+            $starts = @($txt -match 'snapshot lines').Count
+            $dones  = @($txt -match '\[plateau_merge\] done:').Count
+        } catch {}
+    }
+    [pscustomobject]@{ Starts = $starts; Dones = $dones }
 }
 
 # --- SWEEP management -------------------------------------------------------------
@@ -388,6 +423,8 @@ function Finish-Sweep {
 
 # --- ADOPTION: merge/sweep candidates better than the current best ---------------
 $script:AdoptTried = @{}
+# dump-then-merge state: $null, or @{Phase='dump'|'merge'; Since; PhaseAt; Starts0}
+$script:PendingRestart = $null
 function Get-BestCandidate([int]$curBest) {
     $cands = @()
     Get-ChildItem $RunsDir -Filter 'candidate_merge_*.txt' -ErrorAction SilentlyContinue |
@@ -482,6 +519,7 @@ try {
             if ($script:AdoptTried.ContainsKey($cand.File)) { $script:AdoptTried[$cand.File]++ }
             else { $script:AdoptTried[$cand.File] = 1 }
             Log ("ADOPTING {0} ({1} > {2}) - restarting solver seeded from it" -f (Split-Path $cand.File -Leaf), $cand.Score, $cur)
+            $script:PendingRestart = $null   # adoption restarts the solver itself
             Stop-Child $script:SolverProc 'solver'
             Start-Solver $cand.File
         }
@@ -495,24 +533,62 @@ try {
             Archive-Lineage
             $CandidateCutoff = Get-Date   # runs\candidate_merge_* from the old basin must not be re-adopted
             $script:AdoptTried = @{}
+            $script:PendingRestart = $null
             $exhaustBest = -1; $lastBestChange = Get-Date; $lastBest = -1
             Start-Solver $null
             if ($UseMerge) { Start-Merge }
             continue   # $cur is stale (pre-archive); re-read on the next poll
         }
-        # -- stagnation: restart the solver on the same best (pools reset).
-        # Runs even while an exhaustion notify is pending, so the solver keeps
-        # getting pool resets until the user acts on the banner --
+        # -- stagnation: restart the solver on the same best. Runs even while
+        # an exhaustion notify is pending, so the solver keeps getting pool
+        # resets until the user acts on the banner. Dump-then-merge
+        # (2026-07-15 P3): with the merge loop alive, don't kill immediately --
+        # the pool on disk is <=5 min stale (the solver dumps plateau.txt on a
+        # 5-min tick), so wait for a dump newer than the trigger, then for one
+        # full merge pass over it, THEN restart (the restarted solver reloads
+        # the persisted pool). A new best while waiting cancels the restart. --
         elseif ($StagnationHours -gt 0) {
             $last = $script:SolverStarted
             if (Test-Path $BestFile) {
                 $mt = (Get-Item $BestFile).LastWriteTime
                 if ($mt -gt $last) { $last = $mt }
             }
-            if (((Get-Date) - $last).TotalHours -ge $StagnationHours) {
-                Log ("no new best for {0} h - restarting solver (pools reset, same lineage)" -f $StagnationHours)
-                Stop-Child $script:SolverProc 'solver'
-                Start-Solver $null
+            if ($script:PendingRestart -and $last -gt $script:PendingRestart.Since) {
+                Log "stagnation restart cancelled - new best arrived while waiting for the merge pass"
+                $script:PendingRestart = $null
+            }
+            if (-not $script:PendingRestart -and ((Get-Date) - $last).TotalHours -ge $StagnationHours) {
+                if ($DriftEvery -gt 0 -and $UseMerge -and $script:MergeProc -and -not $script:MergeProc.HasExited) {
+                    Log ("no new best for {0} h - dump-then-merge: waiting for a fresh plateau dump, then one merge pass, before the solver restart" -f $StagnationHours)
+                    $script:PendingRestart = @{ Phase = 'dump'; Since = (Get-Date); PhaseAt = (Get-Date); Starts0 = -1 }
+                } else {
+                    Log ("no new best for {0} h - restarting solver (pools reset, same lineage)" -f $StagnationHours)
+                    Stop-Child $script:SolverProc 'solver'
+                    Start-Solver $null
+                }
+            }
+            elseif ($script:PendingRestart) {
+                $pr = $script:PendingRestart
+                if ($pr.Phase -eq 'dump') {
+                    # the solver dumps every 5 min; move on once a dump post-
+                    # dates the trigger (6-min timeout covers a dump mid-write)
+                    $pl = Join-Path $DriftDir 'plateau.txt'
+                    $fresh = (Test-Path $pl) -and ((Get-Item $pl).LastWriteTime -gt $pr.Since)
+                    if ($fresh -or ((Get-Date) - $pr.Since).TotalMinutes -ge 6) {
+                        $pr.Starts0 = (Get-MergePassCounts).Starts
+                        $pr.Phase = 'merge'; $pr.PhaseAt = Get-Date
+                        Log "dump-then-merge: plateau dump on disk - waiting for one full merge pass over it (<=30 min)"
+                    }
+                } elseif ($pr.Phase -eq 'merge') {
+                    $c = Get-MergePassCounts
+                    if ($c.Starts -lt $pr.Starts0) { $pr.Starts0 = $c.Starts }  # merge loop relaunched mid-wait; rebase
+                    if ($c.Dones -gt $pr.Starts0 -or ((Get-Date) - $pr.PhaseAt).TotalMinutes -ge 30) {
+                        Log "dump-then-merge complete - restarting solver (same lineage; the persisted plateau pool reloads at startup)"
+                        $script:PendingRestart = $null
+                        Stop-Child $script:SolverProc 'solver'
+                        Start-Solver $null
+                    }
+                }
             }
         }
         # -- exhaustion notify (independent of the restart chain above) --
