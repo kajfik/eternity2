@@ -26,12 +26,14 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -144,6 +146,24 @@ struct Config {
     int plateau_cap = 4096;          // near-best drift archive size (deduped)
     int region_big_pct = 10;         // % of region moves using the larger cap
     int region_max_big = 24;         // cells in the larger exact windows (<=40)
+    // --- per-node assignment bound (STRATEGY_460 P8 stage 2) ---
+    // exact LAP (Hungarian) upper bound over remaining cells x unused pieces
+    // at every RegionSolver node, warm-started incrementally down the tree.
+    // Strictly tighter than the top-2 dynamic suffix bound (it enforces
+    // piece distinctness); computed only after the cheap bounds fail to
+    // prune. 0 = off (default, bit-identical old behavior).
+    int region_lap = 0;
+    int region_lap_min = 8;   // stop maintaining the bound below this many
+                              // remaining cells (small subtrees are cheap)
+    // --- region-bench harness (STRATEGY_460 P8 stage 1) ---
+    // --mode region-bench: deterministic decide-rate instrumentation for
+    // RegionSolver bounds. Samples a fixed region set (sampler depends only
+    // on bench_seed + the board, never the bound) and solves each at fixed
+    // node caps; identical region sets across bound implementations.
+    int bench_regions = 8;                          // regions per (shape,size)
+    u64 bench_seed = 12345;
+    std::string bench_sizes = "16,24,32";           // region cell counts
+    std::string bench_caps = "2000000,16000000";    // node caps per solve
     // --- Verhaard adoptions (shortestpath.se/eii/eii_details.html, 2026-07-08) ---
     // good-groups piece scheduling: per restart one group is sampled; its
     // members are "good" (high-frequency members "precious"), non-members
@@ -2104,11 +2124,92 @@ struct RegionSolver {
     // tree, that cell's contribution drops to the second-best -- a strictly
     // tighter (still valid) upper bound than the static suffix_max.
     int cmax1[40], cmax2[40], amax_pi[40];
+    // per-(cell,piece) upper bound matrix (best-rotation fixed-edge matches +
+    // all internal decided edges assumed matched; -1 = illegal placement).
+    // Member rather than a prep_and_solve local so the per-node LAP bound can
+    // read it during the search.
+    int val[40][40];
     u64 nodes, cap;
     Rng rrng{1};                   // tie-break randomization (sideways drift)
 
+    // --- per-node assignment bound state (--region-lap, STRATEGY_460 P8) ---
+    // Exact LAP (max-weight perfect matching) over the ACTIVE submatrix:
+    // rows = cells i..n-1, cols = pieces with !pused. Maintained down the
+    // tree: rec(i) derives state[i] from state[i-1] by removing the placed
+    // (cell, piece) pair -- O(1) when they were matched to each other (the
+    // common case for gain-ordered candidates), else one warm-started
+    // augmenting-path repair O(m^2). Each depth saves/restores its own
+    // transition, so the invariant "arrays == state[i] inside rec(i)" holds
+    // on every path. Index n is a virtual column used by lap_insert.
+    bool lap_on = false;
+    int lap_min = 8;
+    int lap_bound = 0;             // LAP optimum of the current active submatrix
+    int lap_u[41], lap_v[41];      // duals (cost form: CBIG - val - u - v >= 0)
+    int lap_mr[41], lap_mc[41];    // matching: row->col, col->row
+    int lap_placed[41];            // region-local piece index placed at depth d
+    int bk_u[41][41], bk_v[41][41], bk_mr[41][41], bk_mc[41][41], bk_bound[41];
+    u64 lap_prunes = 0, lap_cand_prunes = 0, lap_repairs = 0;  // diagnostics
+
     // count edge match: returns 1 if colors equal and non-grey
     static inline int em(u8 a, u8 c) { return a == c && a != 0; }
+
+    // insert unmatched row r_new into the LAP matching over the active
+    // submatrix (shortest augmenting path with dual reuse; the e-maxx
+    // Hungarian inner loop, virtual column nv). Preconditions for warm
+    // starts: duals feasible on active pairs and matched edges tight -- both
+    // survive row/col removal, which is what makes the per-node maintenance
+    // cheap. O(m^2) per call.
+    void lap_insert(int r_new) {
+        const int INF = 1 << 28;
+        const int CBIG = 8;             // >= any val entry; cost = CBIG - val
+        int nv = n_cells;
+        int minv[41], way[41];
+        char usedc[41];
+        for (int c = 0; c <= nv; c++) { minv[c] = INF; way[c] = nv; usedc[c] = 0; }
+        int j0 = nv;
+        do {
+            usedc[j0] = 1;
+            int i0 = j0 == nv ? r_new : lap_mc[j0], delta = INF, j1 = -1;
+            for (int c = 0; c < n_cells; c++) {
+                if (usedc[c] || pused[c]) continue;
+                int cur = CBIG - val[i0][c] - lap_u[i0] - lap_v[c];
+                if (cur < minv[c]) { minv[c] = cur; way[c] = j0; }
+                if (minv[c] < delta) { delta = minv[c]; j1 = c; }
+            }
+            if (j1 < 0) { lap_on = false; return; }  // defensive: cannot happen
+                                                     // (complete bipartite)
+            for (int c = 0; c <= nv; c++) {
+                if (usedc[c]) {
+                    lap_u[c == nv ? r_new : lap_mc[c]] += delta;
+                    lap_v[c] -= delta;
+                } else minv[c] -= delta;
+            }
+            j0 = j1;
+        } while (lap_mc[j0] >= 0);
+        while (j0 != nv) {
+            int j1 = way[j0];
+            int r = j1 == nv ? r_new : lap_mc[j1];
+            lap_mc[j0] = r;
+            lap_mr[r] = j0;
+            j0 = j1;
+        }
+    }
+
+    void lap_save(int d) {
+        memcpy(bk_u[d], lap_u, sizeof lap_u);
+        memcpy(bk_v[d], lap_v, sizeof lap_v);
+        memcpy(bk_mr[d], lap_mr, sizeof lap_mr);
+        memcpy(bk_mc[d], lap_mc, sizeof lap_mc);
+        bk_bound[d] = lap_bound;
+    }
+    void lap_restore(int d, int mode) {
+        lap_bound = bk_bound[d];
+        if (mode < 2) return;          // case-A transitions touched only the scalar
+        memcpy(lap_u, bk_u[d], sizeof lap_u);
+        memcpy(lap_v, bk_v[d], sizeof lap_v);
+        memcpy(lap_mr, bk_mr[d], sizeof lap_mr);
+        memcpy(lap_mc, bk_mc[d], sizeof lap_mc);
+    }
 
     // seed_incumbent=true (default, all pre-existing call sites): B&B starts
     // with the original arrangement as initial best, so capped searches can
@@ -2174,12 +2275,8 @@ struct RegionSolver {
             decided[i] = dcount;
             internal_cnt[i] = dcount - fcount;
         }
-        // per-(cell,piece) upper bound: best-rotation fixed-edge matches +
-        // all internal decided edges assumed matched. val[i][pi] = -1 when
-        // the piece cannot legally sit on the cell (type / ring rotation).
-        // cmax1[i] tightens suffix_max vs decided[i], which assumed any
-        // piece matches every decided edge.
-        int val[40][40];
+        // fill the val member (see declaration): cmax1[i] tightens suffix_max
+        // vs decided[i], which assumed any piece matches every decided edge.
         for (int i = 0; i < n; i++) {
             int s = cells[i], x = s % W, y = s / W;
             int ct = CELL_TYPE[s];
@@ -2276,15 +2373,36 @@ struct RegionSolver {
         // exists in this region -- the search is then useful only for
         // sideways drift, so run it at a fraction of the node budget and
         // spend the savings on regions that can actually gain.
+        // per-node LAP bound root state (--region-lap): build the full
+        // root matching once; rec() maintains it incrementally per placement.
+        lap_min = std::max(4, cfg.region_lap_min);
+        lap_on = cfg.region_lap != 0 && n >= lap_min;
+        lap_prunes = lap_cand_prunes = lap_repairs = 0;
+        if (lap_on) {
+            for (int i = 0; i <= n; i++) {
+                lap_u[i] = lap_v[i] = 0;
+                lap_mr[i] = lap_mc[i] = -1;
+            }
+            for (int i = 0; i < n && lap_on; i++) lap_insert(i);
+            if (lap_on) {
+                lap_bound = 0;
+                for (int i = 0; i < n; i++) lap_bound += val[i][lap_mr[i]];
+            }
+        }
         if (seed_incumbent && n >= 6) {
-            const int BIG = 8;
-            int cost[40 * 40], row_of_col[40];
-            for (int i = 0; i < n; i++)
-                for (int pi = 0; pi < n; pi++)
-                    cost[i * n + pi] = BIG - val[i][pi];
-            hungarian(n, cost, row_of_col);
-            int amax = 0;
-            for (int j = 0; j < n; j++) amax += val[row_of_col[j]][j];
+            int amax;
+            if (lap_on) {
+                amax = lap_bound;  // same LAP optimum, already computed
+            } else {
+                const int BIG = 8;
+                int cost[40 * 40], row_of_col[40];
+                for (int i = 0; i < n; i++)
+                    for (int pi = 0; pi < n; pi++)
+                        cost[i * n + pi] = BIG - val[i][pi];
+                hungarian(n, cost, row_of_col);
+                amax = 0;
+                for (int j = 0; j < n; j++) amax += val[row_of_col[j]][j];
+            }
             if (amax <= inc_gain) {
                 cap = node_cap / 16;
                 g_region_tieproof.fetch_add(1, std::memory_order_relaxed);
@@ -2320,6 +2438,46 @@ struct RegionSolver {
             sfx += pused[amax_pi[j]] ? cmax2[j] : cmax1[j];
         if (gain + sfx <= best_gain) return;
         if (nodes > cap) return;
+        // per-node LAP bound (--region-lap): exact assignment optimum over
+        // remaining cells x unused pieces, checked only after the cheap
+        // bounds fail to prune. Transition from state[i-1]: if the placed
+        // piece was the one the parent matching assigned to the placed cell,
+        // removing the pair keeps the matching optimal (O(1) scalar update);
+        // otherwise free the orphaned column and re-insert the orphaned row
+        // (one O(m^2) warm-started augmentation). Chain stops below lap_min
+        // remaining cells -- subtrees there are cheap to exhaust anyway.
+        int lap_mode = 0;              // 0=not maintained, 1=scalar, 2=full save
+        if (lap_on && i > 0 && n_cells - i >= lap_min) {
+            int r_rm = i - 1, c_rm = lap_placed[i - 1];
+            if (lap_mr[r_rm] == c_rm) {
+                lap_mode = 1;
+                bk_bound[i] = lap_bound;
+                lap_bound -= val[r_rm][c_rm];
+            } else {
+                lap_mode = 2;
+                lap_save(i);
+                int cA = lap_mr[r_rm], rA = lap_mc[c_rm];
+                lap_mc[cA] = -1;
+                lap_insert(rA);
+                lap_repairs++;
+                if (!lap_on) lap_restore(i, 2);  // defensive: LAP disabled
+                                                 // mid-repair; restore and fall
+                                                 // through WITHOUT pruning (the
+                                                 // subtree is still legitimate)
+                else {
+                    lap_bound = 0;
+                    for (int r = i; r < n_cells; r++) lap_bound += val[r][lap_mr[r]];
+                }
+            }
+            if (lap_on && gain + lap_bound <= best_gain) {
+                lap_prunes++;
+                lap_restore(i, lap_mode);
+                return;
+            }
+        }
+        // lap_bound is valid for THIS depth's remaining set only at the root
+        // or when the chain transition above ran
+        bool lap_here = lap_on && (i == 0 || lap_mode != 0);
         int s = cells[i];
         int ct = CELL_TYPE[s];
         static const int DX[4] = {0, 1, 0, -1}, DY[4] = {-1, 0, 1, 0};
@@ -2360,17 +2518,30 @@ struct RegionSolver {
         for (int ci = 0; ci < nc; ci++) {
             // candidates sorted by g desc: once one is prunable, all are
             if (gain + cand[ci].g + sfx1 <= best_gain) break;
-            nodes++;
             int pi = cand[ci].pi;
+            // per-candidate LAP prune: any child completion using (cell i,
+            // piece pi) extends to a perfect matching of THIS depth's LAP,
+            // so child subtree total <= gain + cand.g + lap_bound - val[i][pi]
+            // (val[i][pi] >= the pair's contribution in any matching). Not
+            // sorted by this quantity, so continue rather than break.
+            if (lap_here &&
+                gain + cand[ci].g + lap_bound - val[i][pi] <= best_gain) {
+                lap_cand_prunes++;
+                continue;
+            }
+            nodes++;
             b->piece[s] = (u8)pieces[pi];
             b->rot[s] = cand[ci].k;
             b->filled[s] = true;
             pused[pi] = true;
+            if (lap_on) lap_placed[i] = pi;
             rec(i + 1, gain + cand[ci].g);
             pused[pi] = false;
             b->filled[s] = false;
-            if (nodes > cap) return;
+            if (nodes > cap) break;   // fall through so the LAP state restore
+                                      // below runs on the bail path too
         }
+        if (lap_mode) lap_restore(i, lap_mode);
     }
 };
 
@@ -3689,6 +3860,246 @@ static void dump_fitstats() {
            (unsigned long long)g_fs.completions, cfg.fitstats.c_str());
 }
 
+// ------------------------------------------------------------------ region-bench (STRATEGY_460 P8 stage 1)
+// Deterministic decide-rate instrumentation for RegionSolver bounds: sample a
+// fixed region set (rects + fault-blobs at fixed cell counts, every region
+// touching >=1 fault cell) from one board, solve each region at fixed node
+// caps, and report exhausted (decided) vs capped. The sampler draws only from
+// --bench-seed + the board -- never from the solver -- so baseline and
+// treatment bounds are measured on the IDENTICAL region set (verify via the
+// printed region hashes). Loads its own board (--seed-edges FILE|URL|edges,
+// else the resume best file) and never calls report_completion: zero side
+// effects on best/history files. Single-threaded; decide results are exact,
+// ms is informational.
+static int run_region_bench() {
+    Board base;
+    bool ok = !cfg.seed_url.empty() ? load_board_edges(cfg.seed_url, base)
+                                    : load_board_file(best_path(), base);
+    if (!ok) {
+        printf("ERROR: region-bench needs a board (--seed-edges or %s)\n",
+               best_path().c_str());
+        return 1;
+    }
+    if (!board_conforms(base)) {
+        printf("ERROR: region-bench board violates clues/rim\n");
+        return 1;
+    }
+    int base_score = base.score();
+
+    // fault-cell mark + conflicted-edge list (same rule as Polisher::fault_cells)
+    bool fmark[NC] = {};
+    std::vector<std::pair<int, int>> confl;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            int s = y * W + x;
+            if (!base.filled[s]) continue;
+            if (x + 1 < W && base.filled[s + 1]) {
+                u8 a = base.q(s)[1], c = base.q(s + 1)[3];
+                if (!(a == c && a != 0)) { fmark[s] = fmark[s + 1] = true; confl.push_back({s, s + 1}); }
+            }
+            if (y + 1 < H && base.filled[s + W]) {
+                u8 a = base.q(s)[2], c = base.q(s + W)[0];
+                if (!(a == c && a != 0)) { fmark[s] = fmark[s + W] = true; confl.push_back({s, s + W}); }
+            }
+        }
+    printf("[rbench] board=%d/480 fault_edges=%zu seed=%llu regions/combo=%d "
+           "sizes=%s caps=%s\n", base_score, confl.size(),
+           (unsigned long long)cfg.bench_seed, cfg.bench_regions,
+           cfg.bench_sizes.c_str(), cfg.bench_caps.c_str());
+    if (confl.empty()) { printf("[rbench] board is fault-free; nothing to bench\n"); return 0; }
+
+    auto parse_list = [](const std::string& s, std::vector<u64>& out) {
+        const char* p = s.c_str();
+        char* e;
+        while (*p) {
+            u64 v = strtoull(p, &e, 10);
+            if (e == p) return false;
+            out.push_back(v);
+            p = (*e == ',') ? e + 1 : e;
+            if (*e && *e != ',') return false;
+        }
+        return !out.empty();
+    };
+    std::vector<u64> sizes64, caps;
+    if (!parse_list(cfg.bench_sizes, sizes64) || !parse_list(cfg.bench_caps, caps)) {
+        printf("ERROR: --bench-sizes/--bench-caps want comma-separated numbers\n");
+        return 1;
+    }
+    std::vector<int> sizes;
+    for (u64 v : sizes64) sizes.push_back((int)std::max((u64)8, std::min((u64)40, v)));
+
+    // ---- sample the region set (all sampling BEFORE any solving) ----
+    struct RegionSpec { int shape, size, n, nfault; int cells[40]; u64 hash, seed; };
+    std::vector<RegionSpec> regs;
+    Rng rng(cfg.bench_seed);
+    std::unordered_set<u64> seen;
+    static const char* SHAPE_NAME[2] = {"rect", "blob"};
+    for (int size : sizes)
+        for (int shape = 0; shape < 2; shape++) {
+            // rect: all (w,h) with w*h == size, both sides in [2,16]
+            int fw[16], fh[16], nf_pairs = 0;
+            for (int w = 2; w <= 16; w++)
+                if (size % w == 0 && size / w >= 2 && size / w <= 16) {
+                    fw[nf_pairs] = w; fh[nf_pairs] = size / w; nf_pairs++;
+                }
+            if (shape == 0 && nf_pairs == 0) {
+                printf("[rbench] WARN: no rect factorization for size %d; skipped\n", size);
+                continue;
+            }
+            int got = 0, tries = 0;
+            while (got < cfg.bench_regions && tries < 500000) {
+                tries++;
+                int cells[40], n = 0, nfault = 0;
+                if (shape == 0) {
+                    int pi = (int)rng.below((u32)nf_pairs);
+                    int w = fw[pi], h = fh[pi];
+                    int x0 = (int)rng.below((u32)(W - w + 1));
+                    int y0 = (int)rng.below((u32)(H - h + 1));
+                    bool bad = false;
+                    for (int y = y0; y < y0 + h && !bad; y++)
+                        for (int x = x0; x < x0 + w; x++) {
+                            int s = y * W + x;
+                            // reject rects containing clue cells so the freed
+                            // set is exactly `size` cells
+                            if (IS_CLUE_CELL[s] || !base.filled[s]) { bad = true; break; }
+                            nfault += fmark[s];
+                            cells[n++] = s;
+                        }
+                    if (bad || nfault == 0) continue;
+                } else {
+                    // blob grown from a random conflicted edge (pick_region's
+                    // growth discipline), to exactly `size` cells
+                    int pickc = (int)rng.below((u32)confl.size());
+                    bool inr[NC] = {};
+                    int queue[NC], qn = 0;
+                    int seedc[2] = {confl[pickc].first, confl[pickc].second};
+                    for (int j = 0; j < 2; j++) {
+                        int s = seedc[j];
+                        if (!IS_CLUE_CELL[s] && !inr[s]) {
+                            inr[s] = true; queue[qn++] = s; cells[n++] = s;
+                        }
+                    }
+                    if (n == 0) continue;
+                    while (n < size && qn > 0) {
+                        int qi = (int)rng.below((u32)qn);
+                        int s = queue[qi];
+                        static const int DD[4] = {-W, 1, W, -1};
+                        int dir = (int)rng.below(4);
+                        bool grew = false;
+                        for (int t = 0; t < 4 && !grew; t++, dir = (dir + 1) & 3) {
+                            int x = s % W, y = s / W;
+                            if ((dir == 1 && x == W - 1) || (dir == 3 && x == 0) ||
+                                (dir == 0 && y == 0) || (dir == 2 && y == H - 1)) continue;
+                            int ns = s + DD[dir];
+                            if (inr[ns] || IS_CLUE_CELL[ns] || !base.filled[ns]) continue;
+                            inr[ns] = true;
+                            queue[qn++] = ns;
+                            cells[n++] = ns;
+                            grew = true;
+                        }
+                        if (!grew) queue[qi] = queue[--qn];
+                    }
+                    if (n != size) continue;
+                    for (int i = 0; i < n; i++) nfault += fmark[cells[i]];
+                }
+                std::sort(cells, cells + n);
+                u64 h = 1469598103934665603ULL;
+                for (int i = 0; i < n; i++) {
+                    h ^= (u64)cells[i];
+                    h *= 1099511628211ULL;
+                }
+                if (!seen.insert(h).second) continue;
+                RegionSpec rspec;
+                rspec.shape = shape; rspec.size = size; rspec.n = n;
+                rspec.nfault = nfault;
+                memcpy(rspec.cells, cells, n * sizeof(int));
+                rspec.hash = h;
+                rspec.seed = rng.next();  // one solve seed per region, reused
+                                          // at every cap and by every bound
+                regs.push_back(rspec);
+                got++;
+            }
+            if (got < cfg.bench_regions)
+                printf("[rbench] WARN: only %d/%d %s regions of %d cells sampled\n",
+                       got, cfg.bench_regions, SHAPE_NAME[shape], size);
+        }
+    for (auto& rg : regs) {
+        printf("[rbench] region %s n=%d faults=%d hash=%08llx cells=",
+               SHAPE_NAME[rg.shape], rg.n, rg.nfault,
+               (unsigned long long)(rg.hash & 0xffffffffULL));
+        for (int i = 0; i < rg.n; i++) printf("%s%d", i ? "," : "", rg.cells[i]);
+        printf("\n");
+    }
+
+    // ---- solve ----
+    struct Agg { int solved = 0, decided = 0, tie = 0, imp = 0; u64 nodes = 0; double ms = 0; };
+    std::map<std::tuple<int, int, u64>, Agg> agg;  // (size, shape, cap)
+    static RegionSolver rs;
+    u64 total_nodes = 0;
+    double total_ms = 0;
+    for (auto& rg : regs)
+        for (u64 cap : caps) {
+            Board b2 = base;
+            int before = Polisher::incident_score_and_edges(b2, rg.cells, rg.n).first;
+            auto t0 = std::chrono::steady_clock::now();
+            int gain = rs.prep_and_solve(b2, rg.cells, rg.n, cap, rg.seed);
+            double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+            bool decided = rs.nodes <= rs.cap;   // rec() never bailed: exhaustive
+            bool tie = rs.cap < cap;             // root tieproof cut fired (cap/16)
+            int nsc = b2.score();
+            if (nsc != base_score + (gain - before)) {
+                printf("[rbench] ERROR: score drift (%d + %d - %d != %d)\n",
+                       base_score, gain, before, nsc);
+                return 1;
+            }
+            printf("[rbench] solve %s n=%d hash=%08llx cap=%llu inc=%d best=%d "
+                   "delta=%d nodes=%llu decided=%d tieproof=%d ms=%.1f",
+                   SHAPE_NAME[rg.shape], rg.n,
+                   (unsigned long long)(rg.hash & 0xffffffffULL),
+                   (unsigned long long)cap, before, gain, gain - before,
+                   (unsigned long long)rs.nodes, (int)decided, (int)tie, ms);
+            if (cfg.region_lap)
+                printf(" lapp=%llu lapc=%llu lapr=%llu",
+                       (unsigned long long)rs.lap_prunes,
+                       (unsigned long long)rs.lap_cand_prunes,
+                       (unsigned long long)rs.lap_repairs);
+            printf("\n");
+            fflush(stdout);
+            if (gain > before) {
+                // a strict improvement on the bench board -- on a 455 this is
+                // a 456: save it loudly (solver format + bucas URL)
+                std::string path = cfg.out_dir + "/bench_improved_" +
+                                   std::to_string(nsc) + ".txt";
+                save_board(b2, nsc, path);
+                printf("[rbench] IMPROVEMENT +%d -> %d/480 saved to %s\n%s\n",
+                       gain - before, nsc, path.c_str(), b2.url().c_str());
+            }
+            Agg& a = agg[{rg.size, rg.shape, cap}];
+            a.solved++;
+            a.decided += decided;
+            a.tie += tie;
+            a.imp += gain > before;
+            a.nodes += rs.nodes;
+            a.ms += ms;
+            total_nodes += rs.nodes;
+            total_ms += ms;
+        }
+
+    // ---- summary ----
+    for (auto& [key, a] : agg) {
+        auto [size, shape, cap] = key;
+        printf("[rbench] summary %s size=%d cap=%llu: decided %d/%d tieproof=%d "
+               "imp=%d avg_nodes=%.0f avg_ms=%.1f\n",
+               SHAPE_NAME[shape], size, (unsigned long long)cap, a.decided,
+               a.solved, a.tie, a.imp, (double)a.nodes / a.solved, a.ms / a.solved);
+    }
+    printf("[rbench] total nodes=%llu wall=%.1fs rate=%.0fM/s\n",
+           (unsigned long long)total_nodes, total_ms / 1000.0,
+           total_ms > 0 ? total_nodes / total_ms / 1000.0 : 0.0);
+    return 0;
+}
+
 static void status_thread() {
     auto t0 = std::chrono::steady_clock::now();
     u64 last_nodes = 0;
@@ -3789,6 +4200,12 @@ int main(int argc, char** argv) {
         else if (a == "--plateau-cap") cfg.plateau_cap = std::stoi(next());
         else if (a == "--region-big-pct") cfg.region_big_pct = std::stoi(next());
         else if (a == "--region-max-big") cfg.region_max_big = std::max(8, std::min(40, std::stoi(next())));
+        else if (a == "--region-lap") cfg.region_lap = std::stoi(next());
+        else if (a == "--region-lap-min") cfg.region_lap_min = std::max(4, std::stoi(next()));
+        else if (a == "--bench-regions") cfg.bench_regions = std::max(1, std::stoi(next()));
+        else if (a == "--bench-seed") cfg.bench_seed = std::stoull(next());
+        else if (a == "--bench-sizes") cfg.bench_sizes = next();
+        else if (a == "--bench-caps") cfg.bench_caps = next();
         else if (a == "--groups-file") cfg.groups_file = next();
         else if (a == "--group-order") cfg.group_order = std::stoi(next());
         else if (a == "--group-maxgood") cfg.group_maxgood = std::stoi(next());
@@ -3917,6 +4334,9 @@ int main(int argc, char** argv) {
                cfg.scan_orient, cfg.scan_orient);
 
     if (cfg.mode == "make-groups") return run_make_groups();
+    // region-bench dispatches BEFORE the resume/seed block: it loads its own
+    // board and must never touch report_completion/best files
+    if (cfg.mode == "region-bench") return run_region_bench();
 
     // resume from best file / seed edges
     Board b;
