@@ -11,11 +11,20 @@
 #               pairs of drift snapshots (+ the best board itself); each
 #               improvement lands in runs\candidate_merge_<score>_<hash>.txt.
 #   3. SWEEP    tools\window_sweep.py, rotated over the best board and every
-#               near-best candidate: exact improve-only CP-SAT windows over
-#               fault cells ("does ANY strictly better arrangement of this
-#               window's pieces exist?"). Runs in resumable chunks; pass 1
-#               uses default shapes at --time-per <SweepTimePer>, pass 2
-#               retries UNKNOWN windows at >=600 s each.
+#               near-best candidate (runs\candidate_merge_* plus archived
+#               same-score siblings, e.g. runs\archive_455_basinB -- each is a
+#               distinct piece pool = an independent chance): exact
+#               improve-only CP-SAT windows over fault cells ("does ANY
+#               strictly better arrangement of this window's pieces exist?").
+#               Windows are rectangles + fault-cluster dilations (r=1/r=2,
+#               STRATEGY_460 P4); targets within 1 of the best sweep
+#               easy-first (fewest win_edges: banks INFEASIBLE proofs on
+#               strong boards), weaker ones hard-first (most faults: finds
+#               improvements fast). Runs in resumable chunks; pass 1 uses
+#               --time-per <SweepTimePer>, pass 2 retries UNKNOWN windows at
+#               >=600 s, pass 3 gives the <SweepPass3Top> UNKNOWN windows
+#               with the fewest win_edges per fault <SweepTimePass3> s each
+#               (the overnight tier -- the v3-record protocol, P4iii).
 #
 #   GLUE (this script's poll loop, every 30 s):
 #   - ADOPT: any merge/sweep candidate scoring above the current best is fed
@@ -35,7 +44,7 @@
 #     disables all of this (old behavior: immediate restart, arrival-only
 #     drift snapshots, no plateau.txt) -- the A/B baseline switch.
 #   - EXHAUSTION: no new best for -ExhaustedHours AND the sweep queue is fully
-#     drained (every near-best target has both passes done, no sweep running,
+#     drained (every near-best target has all three passes done, no sweep running,
 #     no adoptable candidate -- any new merge candidate re-fills the queue, so
 #     a drained queue really means merge+sweep have nothing left on this
 #     basin). -OnExhausted picks what happens: 'notify' (default; beeps and
@@ -92,6 +101,11 @@ param(
     [string]$OutDir = 'runs_scratch',
     [double]$SweepChunkMinutes = 45,   # one sweep child invocation's budget
     [double]$SweepTimePer = 300,       # CP-SAT cap per window, pass 1
+    [double]$SweepTimePass3 = 10800,   # CP-SAT cap per window, pass 3 (7200-14400 per
+                                       # STRATEGY_460 P4iii; one window may overrun the
+                                       # chunk -- the chunk check runs between windows)
+    [int]$SweepPass3Top = 4,           # pass 3: how many best-ranked UNKNOWN windows
+                                       # (fewest win_edges per fault) get the long budget
     [double]$Minutes = 0,              # overall wall-clock cap (0 = until Ctrl+C/target)
     [switch]$Fresh,                    # archive best/history/drift/sweep, start a new basin
     [switch]$NoMerge,
@@ -332,6 +346,7 @@ $script:SweepPass = 0
 $script:SweepLog = $null
 
 function Sync-SweepTargets {
+    $score = Get-BestScore
     # candidate_merge boards (from the MERGE loop, or older sessions)
     Get-ChildItem $RunsDir -Filter 'candidate_merge_*.txt' -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -gt $CandidateCutoff } | ForEach-Object {
@@ -340,16 +355,39 @@ function Sync-SweepTargets {
             if (-not (Test-Path $t)) { Copy-Item $_.FullName $t; Log "new sweep target: $(Split-Path $t -Leaf)" }
         }
     }
-    # the current best board itself (try/catch: solver may be mid-rewrite;
-    # skipped copies are retried on the next poll)
-    $score = Get-BestScore
+    # archived same-score siblings (distinct piece pools = independent
+    # chances), e.g. runs\archive_455_basinB. No CandidateCutoff here -- the
+    # score gate does the work instead: only while they really are siblings of
+    # the current best (within 1), so a fresh basin never sweeps an old one.
+    $archDir = Join-Path $RunsDir 'archive_455_basinB'
+    if ($score -ge 0 -and (Test-Path $archDir)) {
+        Get-ChildItem $archDir -Filter '*.txt' -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.Name -match '_(\d+)_([0-9a-f]{8})\.txt$') {
+                $aScore = [int]$Matches[1]
+                if ([Math]::Abs($aScore - $score) -le 1) {
+                    $t = Join-Path $SweepDir ("target_{0}_{1}.txt" -f $aScore, $Matches[2])
+                    if (-not (Test-Path $t)) { Copy-Item $_.FullName $t; Log "new sweep target (archived sibling): $(Split-Path $t -Leaf)" }
+                }
+            }
+        }
+    }
+    # the current best board itself. hash8 = md5 of the edges string -- the
+    # SAME naming plateau_merge uses for candidates, so the best board and its
+    # own merge candidate dedupe to one target instead of two (the old file-MD5
+    # naming swept the identical board twice under different hashes).
+    # try/catch: solver may be mid-rewrite; skipped copies retry next poll.
     if ($score -ge 0) {
         try {
-            $h = (Get-FileHash $BestFile -Algorithm MD5 -ErrorAction Stop).Hash.Substring(0, 8).ToLower()
-            $t = Join-Path $SweepDir ("target_{0}_{1}.txt" -f $score, $h)
-            if (-not (Test-Path $t)) {
-                Copy-Item $BestFile $t -ErrorAction Stop
-                Log "new sweep target: $(Split-Path $t -Leaf)"
+            $txt = Get-Content $BestFile -Raw -ErrorAction Stop
+            if ($txt -match 'board_edges=([a-w]{1024})') {
+                $md5 = [System.Security.Cryptography.MD5]::Create()
+                $h = (-join ($md5.ComputeHash([Text.Encoding]::ASCII.GetBytes($Matches[1])) |
+                             ForEach-Object { $_.ToString('x2') })).Substring(0, 8)
+                $t = Join-Path $SweepDir ("target_{0}_{1}.txt" -f $score, $h)
+                if (-not (Test-Path $t)) {
+                    Copy-Item $BestFile $t -ErrorAction Stop
+                    Log "new sweep target: $(Split-Path $t -Leaf)"
+                }
             }
         } catch {}
     }
@@ -364,29 +402,39 @@ function Pick-SweepTarget([int]$curBest) {
         if ($score -lt $curBest - 1) { return }   # stale plateau, skip
         $p1 = Test-Path "$($_.FullName).pass1.done"
         $p2 = Test-Path "$($_.FullName).pass2.done"
-        if ($p1 -and $p2) { return }              # retired
-        if ($p1) { $pass = 2 } else { $pass = 1 }
+        $p3 = Test-Path "$($_.FullName).pass3.done"
+        if ($p1 -and $p2 -and $p3) { return }     # retired
+        if ($p1 -and $p2) { $pass = 3 } elseif ($p1) { $pass = 2 } else { $pass = 1 }
         $list += [pscustomobject]@{ File = $_.FullName; Score = $score; Pass = $pass; MTime = $_.LastWriteTime }
     }
     if ($list.Count -eq 0) { return $null }
     $list | Sort-Object Pass, @{Expression = 'Score'; Descending = $true}, MTime | Select-Object -First 1
 }
 
-function Start-Sweep($tgt) {
+function Start-Sweep($tgt, [int]$curBest) {
     $tp = $SweepTimePer
     $extra = @()
     if ($tgt.Pass -eq 2) {
         $tp = [math]::Max($SweepTimePer, 600)
         $extra = @('--retry-unknown')
+    } elseif ($tgt.Pass -eq 3) {
+        $tp = $SweepTimePass3
+        $extra = @('--top-unknown', "$SweepPass3Top")
     }
+    # ordering (STRATEGY_460 P4ii): targets within 1 of the adopted best sweep
+    # easy-first (bank cheap INFEASIBLE proofs, shrink the frontier); weaker
+    # targets keep hard-first (most faults first -- it improved the 446/448
+    # targets on their very first window)
+    $ord = 'hard-first'
+    if ($curBest -lt 0 -or $tgt.Score -ge $curBest - 1) { $ord = 'easy-first' }
     $a = @((Join-Path $PSScriptRoot 'tools\window_sweep.py'),
-           '--board', $tgt.File, '--clues', "$Clues",
+           '--board', $tgt.File, '--clues', "$Clues", '--order', $ord,
            '--time-per', "$tp", '--minutes', "$SweepChunkMinutes",
            '--workers', "$SweepWorkers", '--out', "$($tgt.File).improved.txt") + $extra
     $script:SweepLog = Join-Path $LogDir ("sweep_{0}.log" -f (Get-Date -Format yyyyMMdd_HHmmss))
     $script:SweepTargetFile = $tgt.File
     $script:SweepPass = $tgt.Pass
-    Log ("sweep: {0} pass {1} ({2}-min chunk, {3} s/window)" -f (Split-Path $tgt.File -Leaf), $tgt.Pass, $SweepChunkMinutes, $tp)
+    Log ("sweep: {0} pass {1} ({2}-min chunk, {3} s/window, {4})" -f (Split-Path $tgt.File -Leaf), $tgt.Pass, $SweepChunkMinutes, $tp, $ord)
     $script:SweepProc = Start-Process -FilePath $Python -ArgumentList (Quote-Args $a) `
         -WorkingDirectory $PSScriptRoot -NoNewWindow -PassThru `
         -RedirectStandardOutput $script:SweepLog -RedirectStandardError "$($script:SweepLog).err"
@@ -402,6 +450,7 @@ function Finish-Sweep {
         # the improved board becomes its own (better) target
         New-Item -ItemType File -Force "$t.pass1.done" | Out-Null
         New-Item -ItemType File -Force "$t.pass2.done" | Out-Null
+        New-Item -ItemType File -Force "$t.pass3.done" | Out-Null
         Log "sweep IMPROVEMENT on $(Split-Path $t -Leaf) - see $t.improved.txt"
         return
     }
@@ -614,7 +663,7 @@ try {
                 # NB: not named $target -- that would collide (case-insensitively)
                 # with the [int]$Target script parameter and force an int cast
                 $pick = Pick-SweepTarget $cur
-                if ($pick) { Start-Sweep $pick }
+                if ($pick) { Start-Sweep $pick $cur }
             }
         }
         # -- status line (once a minute) --
